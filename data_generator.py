@@ -2,12 +2,13 @@ import networkx as nx
 import torch
 from torch_geometric.data import Data
 import random
+import gale_shapley
 
 def generate_graph(group_nodes=10):
     G = nx.Graph()
 
-    for i in range(group_nodes*2):
-        G.add_node(i)
+    G.add_nodes_from(list(range(group_nodes)), bipartite=0)
+    G.add_nodes_from(list(range(group_nodes)), bipartite=1)
 
     for i in range(group_nodes):
         for j in range(group_nodes):
@@ -27,21 +28,36 @@ def graph_to_pyg_data(G, group_size):
         edges.append([vi, ui])
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
-
+    set1, set2 = nx.bipartite.sets(G)
 
     x = []
-    for i in range(len(nodes)):
-        temp = []
-        for j in range(group_size):
-            temp.append(j)
-        random.shuffle(temp)
-        x.append(temp)
-    print(x)
+    proposer_pref = {}
+    proposee_pref = {}
 
+    for node in set1:
+        prefs = list(range(group_size,group_size*2))
+        random.shuffle(prefs)
+        x.append(prefs)
+        proposer_pref[node] = prefs
+
+    for node in set2:
+        prefs = list(range(group_size))
+        random.shuffle(prefs)
+        x.append(prefs)
+        ranks = {}
+        for set1node in set1:
+            ranks[set1node] = prefs[set1node]
+        proposee_pref[node] = ranks
+
+    data_x= torch.tensor(x, dtype=torch.float)
+
+    matching = gale_shapley.solve(G,set1,set2,proposer_pref,proposee_pref)
+    print("Matching -----------")
+    print(matching)
 
 
     data = Data(
-        x=x,
+        x=data_x,
         edge_index=edge_index
 
     )

@@ -1,34 +1,58 @@
-def solve(men_preferences, women_preferences):
-    n = len(men_preferences)
-    free_men = list(men_preferences.keys())  # All men start out free
-    engaged_pairs = {}  # To store engaged pairs
-    men_proposals = {man: [] for man in men_preferences}  # Track proposals
-
-    # While there are free men who haven't proposed to all women
-    while free_men:
-        man = free_men[0]  # Grab the first free man
-        man_pref = men_preferences[man]
-        for woman in man_pref:
-            if woman not in men_proposals[man]:
-                men_proposals[man].append(woman)  # Record the proposal
-
-                # If the woman is free, engage them
-                if woman not in engaged_pairs.values():
-                    engaged_pairs[man] = woman
-                    free_men.remove(man)
-                    break
-                else:
-                    # If the woman is already engaged, check if she prefers the new man
-                    current_man = next(m for m, w in engaged_pairs.items() if w == woman)
-                    woman_pref = women_preferences[woman]
-                    if woman_pref.index(man) < woman_pref.index(current_man):
-                        # Engage the new man and free the current one
-                        engaged_pairs[man] = woman
-                        free_men.remove(man)
-                        free_men.append(current_man)
-                        del engaged_pairs[current_man]
-                        break
-
-    return engaged_pairs
+import networkx as nx
+from collections import deque, defaultdict
 
 
+def solve(G, proposers, proposees, proposer_prefs, proposee_prefs):
+    # Validate bipartite
+    assert nx.is_bipartite(G)
+    print("Inputs -------------------")
+    print(G.nodes())
+    print(proposers)
+    print(proposees)
+    print(proposer_prefs)
+    print(proposee_prefs)
+    # Current proposals index for each proposer
+    next_proposal = {p: 0 for p in proposers}
+
+    # Free proposers queue
+    free_proposers = deque(proposers)
+
+    # Current matches: proposee -> proposer
+    matches = {pe: None for pe in proposees}
+
+    while free_proposers:
+        p = free_proposers.popleft()
+
+        prefs = proposer_prefs[p]
+        proposed = False
+
+        while next_proposal[p] < len(prefs) and not proposed:
+            pe = prefs[next_proposal[p]]
+
+            if pe not in G[p]:  # No edge, skip
+                next_proposal[p] += 1
+                continue
+
+            next_proposal[p] += 1
+
+            current = matches[pe]
+
+            if current is None:
+                # Accept
+                matches[pe] = p
+                proposed = True
+            else:
+                # Compare ranks (lower better)
+                if proposee_prefs[pe][p] < proposee_prefs[pe][current]:
+                    # Accept new, reject old
+                    matches[pe] = p
+                    free_proposers.append(current)
+                    proposed = True
+
+
+    # Return proposer-centric matching
+    result = {}
+    for pe, p in matches.items():
+        if p is not None:
+            result[p] = pe
+    return result
