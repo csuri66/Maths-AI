@@ -1,16 +1,8 @@
 import networkx as nx
-from collections import deque, defaultdict
+from collections import deque
 
 
 def solve(G, proposers, proposees, proposer_prefs, proposee_prefs):
-    # Validate bipartite
-    assert nx.is_bipartite(G)
-    print("Inputs -------------------")
-    print(G.nodes())
-    print(proposers)
-    print(proposees)
-    print(proposer_prefs)
-    print(proposee_prefs)
     # Current proposals index for each proposer
     next_proposal = {p: 0 for p in proposers}
 

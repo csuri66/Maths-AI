@@ -52,13 +52,21 @@ def graph_to_pyg_data(G, group_size):
     data_x= torch.tensor(x, dtype=torch.float)
 
     matching = gale_shapley.solve(G,set1,set2,proposer_pref,proposee_pref)
-    print("Matching -----------")
-    print(matching)
+    e_attr= []
 
+    for u,v in G.edges():
+        if (u in matching and matching[u] == v) or (v in matching and matching[v] == u):
+            e_attr.append(1)
+        else:
+            e_attr.append(0)
 
+    edge_attr = torch.tensor(e_attr, dtype=torch.float)
+    print(len(edge_index[0]))
+    print(len(edge_index[1]))
+    print(len(edge_attr))
     data = Data(
         x=data_x,
-        edge_index=edge_index
-
+        edge_index=edge_index,
+        edge_attr=edge_attr
     )
     return data
