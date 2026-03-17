@@ -3,20 +3,27 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
 class GATEdgeClassifier(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels):
         super().__init__()
-        self.gat1 = GATConv(in_channels, hidden_channels)
-        self.gat2 = GATConv(hidden_channels, out_channels)
-        self.lin = torch.nn.Linear(out_channels * 2, 1)  # src + dst + edge_attr
+        self.gat1 = GATConv(in_channels, hidden_channels, heads=2, concat=False)
+        self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
+
+        self.edge_mlp = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels * 2, hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(hidden_channels, 1)
+        )
 
     def forward(self, data):
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        x = F.relu(self.gat1(x, edge_index, edge_attr))
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.gat2(x, edge_index, edge_attr)
+        x, edge_index = data.x, data.edge_index
+
+        x0 = x
+        x = self.gat1(x, edge_index)
+        x = F.relu(x + self.skip1(x0))
 
         src, dst = edge_index
         edge_emb = torch.cat([x[src], x[dst]], dim=-1)
-        edge_pred = torch.sigmoid(self.lin(edge_emb)).squeeze()
-        return edge_pred
+        logits = self.edge_mlp(edge_emb).squeeze(-1)
+        return logits
 

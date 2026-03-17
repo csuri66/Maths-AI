@@ -2,49 +2,57 @@ import networkx as nx
 from collections import deque
 
 
-def solve(G, proposers, proposees, proposer_prefs, proposee_prefs):
-    # Current proposals index for each proposer
-    next_proposal = {p: 0 for p in proposers}
+def stable_matching_with_preferences(G, left_nodes, right_nodes, prefs_left, prefs_right):
 
-    # Free proposers queue
-    free_proposers = deque(proposers)
+    left_nodes = list(left_nodes)
+    right_nodes = list(right_nodes)
+    right_set = set(right_nodes)
+    left_set = set(left_nodes)
 
-    # Current matches: proposee -> proposer
-    matches = {pe: None for pe in proposees}
+    # Csak létező és a gráfban ténylegesen jelen levő szomszédok maradnak
+    filtered_left = {}
+    for u in left_nodes:
+        pref_list = prefs_left.get(u, [])
+        filtered_left[u] = [v for v in pref_list if v in right_set and G.has_edge(u, v)]
 
-    while free_proposers:
-        p = free_proposers.popleft()
+    filtered_right = {}
+    for v in right_nodes:
+        pref_list = prefs_right.get(v, [])
+        filtered_right[v] = [u for u in pref_list if u in left_set and G.has_edge(u, v)]
 
-        prefs = proposer_prefs[p]
-        proposed = False
+    rank_right = {
+        v: {u: i for i, u in enumerate(filtered_right[v])}
+        for v in right_nodes
+    }
 
-        while next_proposal[p] < len(prefs) and not proposed:
-            pe = prefs[next_proposal[p]]
+    match_left = {u: None for u in left_nodes}
+    match_right = {v: None for v in right_nodes}
+    next_proposal_idx = {u: 0 for u in left_nodes}
 
-            if pe not in G[p]:  # No edge, skip
-                next_proposal[p] += 1
-                continue
+    free_left = deque(left_nodes)
 
-            next_proposal[p] += 1
+    while free_left:
+        u = free_left.popleft()
 
-            current = matches[pe]
+        if next_proposal_idx[u] >= len(filtered_left[u]):
+            continue
 
-            if current is None:
-                # Accept
-                matches[pe] = p
-                proposed = True
+        v = filtered_left[u][next_proposal_idx[u]]
+        next_proposal_idx[u] += 1
+
+        current = match_right[v]
+
+        if current is None:
+            match_left[u] = v
+            match_right[v] = u
+        else:
+            if rank_right[v][u] < rank_right[v][current]:
+                match_left[current] = None
+                free_left.append(current)
+
+                match_left[u] = v
+                match_right[v] = u
             else:
-                # Compare ranks (lower better)
-                if proposee_prefs[pe][p] < proposee_prefs[pe][current]:
-                    # Accept new, reject old
-                    matches[pe] = p
-                    free_proposers.append(current)
-                    proposed = True
+                free_left.append(u)
 
-
-    # Return proposer-centric matching
-    result = {}
-    for pe, p in matches.items():
-        if p is not None:
-            result[p] = pe
-    return result
+    return match_left
