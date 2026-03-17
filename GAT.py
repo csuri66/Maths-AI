@@ -1,11 +1,18 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import TransformerConv
+
 
 class GATEdgeClassifier(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super().__init__()
-        self.gat1 = GATConv(in_channels, hidden_channels, heads=2, concat=False)
+        self.gat1 = TransformerConv(
+            in_channels,
+            hidden_channels,
+            heads=1,
+            concat=False,
+            dropout=0.2
+        )
         self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
 
         self.edge_mlp = torch.nn.Sequential(

@@ -80,22 +80,20 @@ def graph_to_pyg_data(G, group_size,verbose=False):
     proposee_pref = {}
 
     for node in set1:
-        prefs = list(range(group_size,group_size*2))
-        random.shuffle(prefs)
-        x.append(prefs)
-        proposer_pref[node] = prefs
+        prefs_for_gale = list(range(group_size,group_size*2))
+        random.shuffle(prefs_for_gale)
+        prefs_for_model = [x - group_size for x in prefs_for_gale]
+        x.append(prefs_for_model)
+        proposer_pref[node] = prefs_for_gale
 
     for node in set2:
-        prefs = list(range(group_size))
-        random.shuffle(prefs)
-        x.append(prefs)
-        ranks = {}
-        for set1node in set1:
-            ranks[set1node] = prefs[set1node]
-        proposee_pref[node] = ranks
+        prefs_for_gale = list(range(group_size))
+        random.shuffle(prefs_for_gale)
+        prefs_for_model = prefs_for_gale
+        x.append(prefs_for_model)
+        proposee_pref[node] = prefs_for_gale
 
     data_x= torch.tensor(x, dtype=torch.float)
-
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
     if(verbose):
         print("Optimal matching")

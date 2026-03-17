@@ -1,12 +1,7 @@
-from torch import device
+
 import torch
-from torch.nn import BCEWithLogitsLoss
-from torch_geometric.loader import DataLoader
 import GAT
 import data_generator
-import torch.nn.functional as nn
-import numpy as np
-from scipy.optimize import linear_sum_assignment
 import networkx as nx
 
 def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
@@ -116,7 +111,7 @@ def is_stable_matching(match_a, prefs_a, prefs_b):
 
     return len(blocking_pairs) == 0, blocking_pairs
 
-group_size=6
+group_size=3
 
 raw_train_graphs =[]
 
@@ -139,22 +134,84 @@ for graph in val_graphs:
 
 
 model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 pos = sum(data.edge_attr.sum().item() for data in train_data)
 total = sum(data.edge_attr.numel() for data in train_data)
 neg = total - pos
-pos_weight = torch.tensor([neg / pos], dtype=torch.float)
-criterion = torch.nn.BCEWithLogitsLoss()
+pos_weight = torch.tensor(3.0, dtype=torch.float)
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+patience = 10
+min_delta = 1e-4
+best_val_loss = float("inf")
+patience_counter = 0
+best_path = "best_model.pt"
 
 
-for data in train_data:
-    optimizer.zero_grad()
-    logits = model(data)
+#for data in train_data:
+    #optimizer.zero_grad()
+    #logits = model(data)
     #print("Logits mean/std:", logits.mean().item(), logits.std().item())
     #print("Labels mean:", data.edge_attr.float().mean().item())
-    loss =criterion(logits, data.edge_attr.float())
-    loss.backward()
-    optimizer.step()
+    #loss =criterion(logits, data.edge_attr.float())
+    #loss.backward()
+    #optimizer.step()
+
+
+patience = 5
+min_delta = 1e-4
+eval_every = 10
+
+best_val_loss = float("inf")
+bad_checks = 0
+global_step = 0
+stop_training = False
+
+for epoch in range(2):
+    model.train()
+
+    for data in train_data:
+        optimizer.zero_grad()
+        logits = model(data)
+        loss = criterion(logits, data.edge_attr.float())
+        loss.backward()
+        optimizer.step()
+
+        global_step += 1
+
+        if global_step % eval_every == 0:
+            model.eval()
+            val_loss_sum = 0.0
+            val_count = 0
+
+            with torch.no_grad():
+                for val_batch in val_data:
+                    val_logits = model(val_batch)
+                    val_loss = criterion(val_logits, val_batch.edge_attr.float())
+                    val_loss_sum += val_loss.item()
+                    val_count += 1
+
+            mean_val_loss = val_loss_sum / max(val_count, 1)
+            print(f"step={global_step}, val_loss={mean_val_loss:.4f}")
+
+            if mean_val_loss < best_val_loss - min_delta:
+                best_val_loss = mean_val_loss
+                bad_checks = 0
+                torch.save(model.state_dict(), "best_model.pt")
+            else:
+                bad_checks += 1
+
+            model.train()
+
+            if bad_checks >= patience:
+                print("Early stopping")
+                stop_training = True
+                break
+
+    if stop_training:
+        break
+
+model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 
 
 
