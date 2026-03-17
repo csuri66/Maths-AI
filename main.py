@@ -5,23 +5,13 @@ import data_generator
 import networkx as nx
 
 def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
-    """
-    selected_nodes: pl. [0, 2, 4, 5, 7, 8, 10, 12, 15, 18]
-    edge_index: torch.Tensor [2, E]
-    edge_probs: torch.Tensor [E] vagy [E, 1]
 
-    Visszatér:
-      matching_edges: lista [(u, v, prob, best_dir, edge_idx), ...]
-      unmatched: lista [node, ...]
-    """
     selected_nodes = list(selected_nodes)
     selected_set = set(selected_nodes)
 
     ei = edge_index.detach().cpu()
     probs = edge_probs.detach().cpu().view(-1)
 
-    # Irányított -> irányítatlan összevonás
-    # Minden irányítatlan élhez a jobbik irány valószínűségét tartjuk meg
     pair_best = {}  # (u,v) -> (prob, src, dst, edge_idx)
 
     E = ei.size(1)
@@ -29,7 +19,6 @@ def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
         src = int(ei[0, e].item())
         dst = int(ei[1, e].item())
 
-        # Csak a kijelölt csúcsok közötti élek érdekelnek
         if src not in selected_set or dst not in selected_set:
             continue
         if src == dst:
@@ -41,14 +30,12 @@ def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
         if (u, v) not in pair_best or p > pair_best[(u, v)][0]:
             pair_best[(u, v)] = (p, src, dst, e)
 
-    # Súlyozott irányítatlan gráf építése
     G = nx.Graph()
     G.add_nodes_from(selected_nodes)
 
     for (u, v), (p, src, dst, e) in pair_best.items():
         G.add_edge(u, v, weight=p, best_dir=(src, dst), edge_idx=e)
 
-    # Maximum súlyú matching
     matching = nx.max_weight_matching(G, maxcardinality=True, weight="weight")
 
     matching_edges = []
@@ -68,14 +55,6 @@ def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
 
 
 def is_stable_matching(match_a, prefs_a, prefs_b):
-    """
-    match_a: dict, pl. {'a1': 'b2', 'a2': 'b1', ...}
-    prefs_a: dict, pl. {'a1': ['b1','b2','b3'], ...}
-    prefs_b: dict, pl. {'b1': ['a2','a1','a3'], ...}
-
-    Visszaad:
-      (stable, blocking_pairs)
-    """
 
     match_b = {b: a for a, b in match_a.items() if b is not None}
 
@@ -134,29 +113,19 @@ for graph in val_graphs:
 
 
 model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 pos = sum(data.edge_attr.sum().item() for data in train_data)
 total = sum(data.edge_attr.numel() for data in train_data)
 neg = total - pos
 pos_weight = torch.tensor(3.0, dtype=torch.float)
-criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+#criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+criterion = torch.nn.BCEWithLogitsLoss()
 
 patience = 10
 min_delta = 1e-4
 best_val_loss = float("inf")
 patience_counter = 0
 best_path = "best_model.pt"
-
-
-#for data in train_data:
-    #optimizer.zero_grad()
-    #logits = model(data)
-    #print("Logits mean/std:", logits.mean().item(), logits.std().item())
-    #print("Labels mean:", data.edge_attr.float().mean().item())
-    #loss =criterion(logits, data.edge_attr.float())
-    #loss.backward()
-    #optimizer.step()
-
 
 patience = 5
 min_delta = 1e-4
@@ -222,10 +191,10 @@ for data in val_data:
     logits = model(data)
     loss = criterion(logits, data.edge_attr.float())
 
-    total_loss += loss.item() * data.edge_attr.numel()  # vagy data.num_edges ha teljes
+    total_loss += loss.item() * data.edge_attr.numel()
     total_edges += data.edge_attr.numel()
 
-avg_loss = total_loss / total_edges if total_edges > 0 else 0  # normalizáld megfelelően
+avg_loss = total_loss / total_edges if total_edges > 0 else 0
 print(avg_loss)
 
 proba = data_generator.generate_graph(group_size)
@@ -235,16 +204,6 @@ proba_logits = model(proba)
 probs = torch.sigmoid(proba_logits)
 print(probs)
 preds = (probs > 0.5).int()
-topk_edges = torch.topk(probs, k=10).indices
-edge_scores = torch.topk(probs, k=10).values
-#print(topk_edges)
-
-src_nodes = proba.edge_index[0, topk_edges]  # forrás csúcsok
-dst_nodes = proba.edge_index[1, topk_edges]  # cél csúcsok
-
-#for i in range(10):
-    #print(f"#{i+1}: {src_nodes[i].item()} → {dst_nodes[i].item()} "
-          #f"(p={edge_scores[i].item():.3f})")
 
 
 
@@ -258,7 +217,7 @@ print("Kiválasztott párok:")
 pair_dict= {}
 for u, v, p, best_dir, edge_idx in pairs:
     pair_dict[u]=v
-    print(f"{u} -- {v} | p={p:.4f} | jobb irány: {best_dir[0]}->{best_dir[1]} | edge_idx={edge_idx}")
+    print(f"{u} -- {v} | p={p:.4f}  | edge_idx={edge_idx}")
 
 print("Pár nélkül maradt csúcsok:", unmatched)
 print(is_stable_matching(pair_dict,proba.proposer_pref,proba.proposee_pref))

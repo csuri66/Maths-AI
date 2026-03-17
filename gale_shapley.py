@@ -9,7 +9,6 @@ def stable_matching_with_preferences(G, left_nodes, right_nodes, prefs_left, pre
     right_set = set(right_nodes)
     left_set = set(left_nodes)
 
-    # Csak létező és a gráfban ténylegesen jelen levő szomszédok maradnak
     filtered_left = {}
     for u in left_nodes:
         pref_list = prefs_left.get(u, [])

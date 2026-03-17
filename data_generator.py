@@ -17,14 +17,6 @@ def generate_graph(group_nodes=10):
 
 
 def is_stable_matching(match_a, prefs_a, prefs_b):
-    """
-    match_a: dict, pl. {'a1': 'b2', 'a2': 'b1', ...}
-    prefs_a: dict, pl. {'a1': ['b1','b2','b3'], ...}
-    prefs_b: dict, pl. {'b1': ['a2','a1','a3'], ...}
-
-    Visszaad:
-      (stable, blocking_pairs)
-    """
 
     match_b = {b: a for a, b in match_a.items() if b is not None}
 
