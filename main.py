@@ -112,14 +112,27 @@ for graph in val_graphs:
     val_data.append(data_generator.graph_to_pyg_data(graph,group_size))
 
 
+all_train_x = torch.cat([g.x for g in train_data], dim=0)
+
+mean = all_train_x.mean(dim=0, keepdim=True)
+std = all_train_x.std(dim=0, keepdim=True)
+
+for g in train_data:
+    g.x = (g.x - mean) / std
+
+for g in val_data:
+    g.x = (g.x - mean) / std
+
+
+
 model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 pos = sum(data.edge_attr.sum().item() for data in train_data)
 total = sum(data.edge_attr.numel() for data in train_data)
 neg = total - pos
-pos_weight = torch.tensor(3.0, dtype=torch.float)
-#criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-criterion = torch.nn.BCEWithLogitsLoss()
+pos_weight = torch.tensor(neg/pos, dtype=torch.float)
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+#criterion = torch.nn.BCEWithLogitsLoss()
 
 patience = 10
 min_delta = 1e-4
@@ -187,12 +200,13 @@ model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 model.eval()
 total_loss = 0
 total_edges = 0
-for data in val_data:
-    logits = model(data)
-    loss = criterion(logits, data.edge_attr.float())
+with torch.no_grad():
+    for data in val_data:
+        logits = model(data)
+        loss = criterion(logits, data.edge_attr.float())
 
-    total_loss += loss.item() * data.edge_attr.numel()
-    total_edges += data.edge_attr.numel()
+        total_loss += loss.item() * data.edge_attr.numel()
+        total_edges += data.edge_attr.numel()
 
 avg_loss = total_loss / total_edges if total_edges > 0 else 0
 print(avg_loss)
@@ -203,8 +217,8 @@ proba = data_generator.graph_to_pyg_data(proba,group_size,verbose=True)
 proba_logits = model(proba)
 probs = torch.sigmoid(proba_logits)
 print(probs)
-preds = (probs > 0.5).int()
 
+proba.x =(proba.x - mean) / std
 
 
 pairs, unmatched = best_pairing_for_selected_nodes(

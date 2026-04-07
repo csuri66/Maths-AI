@@ -58,12 +58,7 @@ def graph_to_pyg_data(G, group_size,verbose=False):
     nodes = list(G.nodes())
     node_id_map = {n: i for i, n in enumerate(nodes)}
 
-    edges = []
-    for u, v in G.edges():
-        ui, vi = node_id_map[u], node_id_map[v]
-        edges.append([ui, vi])
-        edges.append([vi, ui])
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+
 
     set1, set2 = nx.bipartite.sets(G)
 
@@ -78,6 +73,7 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         x.append(prefs_for_model)
         proposer_pref[node] = prefs_for_gale
 
+
     for node in set2:
         prefs_for_gale = list(range(group_size))
         random.shuffle(prefs_for_gale)
@@ -85,9 +81,60 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         x.append(prefs_for_model)
         proposee_pref[node] = prefs_for_gale
 
+    edge_weight = []
+
+    look=1*group_size
+    who_am_i=0
+    where_am_i =0
+    for node in set1:
+        look = 1 * group_size
+        x[where_am_i].append(0)
+        x[where_am_i].append(0)
+        for node2 in set2:
+            if x[look][0] == who_am_i:
+                x[where_am_i][group_size] +=1
+            x[where_am_i][group_size+1]+=x[look].index(who_am_i)+1
+            look+=1
+        x[where_am_i][group_size] *= 10 *group_size
+        x[where_am_i][group_size + 1] = x[where_am_i][group_size+1] *10
+        where_am_i+=1
+        who_am_i+=1
+
+    look = 0
+    who_am_i = 0
+    where_am_i = group_size
+    for node in set2:
+        look = 0
+        x[where_am_i].append(0)
+        x[where_am_i].append(0)
+        for node2 in set1:
+            if x[look][0] == who_am_i:
+                x[where_am_i][group_size] += 1
+            x[where_am_i][group_size + 1] += x[look].index(who_am_i)+1
+            look += 1
+        x[where_am_i][group_size] *=10 *group_size
+        x[where_am_i][group_size + 1] = x[where_am_i][group_size + 1] *10
+        where_am_i+=1
+        who_am_i += 1
+
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
+
+    edges = []
+    for u, v in G.edges():
+        ui, vi = node_id_map[u], node_id_map[v]
+        edges.append([ui, vi])
+        edges.append([vi, ui])
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+
+
+
+
+
     data_x= torch.tensor(x, dtype=torch.float)
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
     if(verbose):
+        for line in x:
+            print(line)
         print("Optimal matching")
         print(is_stable_matching(matching, proposer_pref, proposee_pref))
         print(matching)
@@ -105,6 +152,7 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         x=data_x,
         edge_index=edge_index,
         edge_attr=edge_attr,
+        edge_weight=edge_weight,
         proposee_pref = proposee_pref,
         proposer_pref = proposer_pref
     )
