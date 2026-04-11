@@ -3,6 +3,7 @@ import torch
 from torch_geometric.data import Data
 import random
 import gale_shapley
+from itertools import chain
 
 def generate_graph(group_nodes=10):
     G = nx.Graph()
@@ -66,37 +67,43 @@ def graph_to_pyg_data(G, group_size,verbose=False):
     proposer_pref = {}
     proposee_pref = {}
 
+    edge_weight = []
+
     for node in set1:
         prefs_for_gale = list(range(group_size,group_size*2))
         random.shuffle(prefs_for_gale)
         prefs_for_model = [x - group_size for x in prefs_for_gale]
+        edge_weight += [10 - x for x in prefs_for_model]
         x.append(prefs_for_model)
         proposer_pref[node] = prefs_for_gale
 
-
+    temp = []
     for node in set2:
         prefs_for_gale = list(range(group_size))
         random.shuffle(prefs_for_gale)
         prefs_for_model = prefs_for_gale
+
+        temp += [10 - x for x in prefs_for_model]
+        edge_weight= list(chain(*zip(temp, edge_weight)))
         x.append(prefs_for_model)
         proposee_pref[node] = prefs_for_gale
 
-    edge_weight = []
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
     look=1*group_size
     who_am_i=0
     where_am_i =0
+    x_final = []
     for node in set1:
         look = 1 * group_size
-        x[where_am_i].append(0)
-        x[where_am_i].append(0)
+        x_final.append([])
+        x_final[who_am_i].append(0)
+        x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
-                x[where_am_i][group_size] +=1
-            x[where_am_i][group_size+1]+=x[look].index(who_am_i)+1
+                x_final[who_am_i][0]  +=1*group_size
+            x_final[who_am_i][1]+=x[look].index(who_am_i)+1
             look+=1
-        x[where_am_i][group_size] *= 10 *group_size
-        x[where_am_i][group_size + 1] = x[where_am_i][group_size+1] *10
         where_am_i+=1
         who_am_i+=1
 
@@ -105,19 +112,17 @@ def graph_to_pyg_data(G, group_size,verbose=False):
     where_am_i = group_size
     for node in set2:
         look = 0
-        x[where_am_i].append(0)
-        x[where_am_i].append(0)
+        x_final.append([])
+        x_final[where_am_i].append(0)
+        x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
-                x[where_am_i][group_size] += 1
-            x[where_am_i][group_size + 1] += x[look].index(who_am_i)+1
+                x_final[where_am_i][0] += 1 *group_size
+            x_final[where_am_i][1] += x[look].index(who_am_i)+1
             look += 1
-        x[where_am_i][group_size] *=10 *group_size
-        x[where_am_i][group_size + 1] = x[where_am_i][group_size + 1] *10
         where_am_i+=1
         who_am_i += 1
 
-    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
     edges = []
     for u, v in G.edges():
@@ -129,14 +134,13 @@ def graph_to_pyg_data(G, group_size,verbose=False):
 
 
 
-
-    data_x= torch.tensor(x, dtype=torch.float)
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
     if(verbose):
         for line in x:
             print(line)
         print("Optimal matching")
         print(is_stable_matching(matching, proposer_pref, proposee_pref))
+        print(x_final)
         print(matching)
     e_attr= []
 
@@ -148,11 +152,12 @@ def graph_to_pyg_data(G, group_size,verbose=False):
             e_attr.append(0)
             e_attr.append(0)
     edge_attr = torch.tensor(e_attr, dtype=torch.float)
+    data_x = torch.tensor(x_final, dtype=torch.float)
     data = Data(
         x=data_x,
         edge_index=edge_index,
-        edge_attr=edge_attr,
-        edge_weight=edge_weight,
+        edge_attr=edge_weight,
+        edge_y=edge_attr,
         proposee_pref = proposee_pref,
         proposer_pref = proposer_pref
     )

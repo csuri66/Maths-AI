@@ -11,7 +11,8 @@ class GATEdgeClassifier(torch.nn.Module):
             hidden_channels,
             heads=1,
             concat=False,
-            dropout=0.2
+            dropout=0.2,
+            edge_dim = 1
         )
         self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
 
@@ -23,10 +24,10 @@ class GATEdgeClassifier(torch.nn.Module):
         )
 
     def forward(self, data):
-        x, edge_index = data.x, data.edge_index
+        x, edge_index,edge_attr = data.x, data.edge_index,torch.tensor(data.edge_attr, dtype=torch.float).view(-1, 1)
 
         x0 = x
-        x = self.gat1(x, edge_index)
+        x = self.gat1(x, edge_index,edge_attr)
         x = F.relu(x + self.skip1(x0))
 
         src, dst = edge_index

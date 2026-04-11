@@ -95,7 +95,7 @@ group_size=3
 raw_train_graphs =[]
 
 # Tanító
-for i in range(1000):
+for i in range(5000):
     raw_train_graphs.append(data_generator.generate_graph(group_size))
 
 train_data = []
@@ -113,22 +113,27 @@ for graph in val_graphs:
 
 
 all_train_x = torch.cat([g.x for g in train_data], dim=0)
+all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
 
 mean = all_train_x.mean(dim=0, keepdim=True)
+mean_edge = all_train_edge.mean(dim=0, keepdim=True)
+
 std = all_train_x.std(dim=0, keepdim=True)
+std_edge =  all_train_edge.std(dim=0, keepdim=True)
 
 for g in train_data:
     g.x = (g.x - mean) / std
+    g.edge_attr=(g.edge_attr - mean_edge) / std_edge
 
 for g in val_data:
     g.x = (g.x - mean) / std
-
+    g.edge_attr = (g.edge_attr - mean_edge) / std_edge
 
 
 model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-pos = sum(data.edge_attr.sum().item() for data in train_data)
-total = sum(data.edge_attr.numel() for data in train_data)
+pos = sum(data.edge_y.sum().item() for data in train_data)
+total = sum(data.edge_y.numel() for data in train_data)
 neg = total - pos
 pos_weight = torch.tensor(neg/pos, dtype=torch.float)
 criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -140,7 +145,7 @@ best_val_loss = float("inf")
 patience_counter = 0
 best_path = "best_model.pt"
 
-patience = 5
+patience = 100
 min_delta = 1e-4
 eval_every = 10
 
@@ -149,13 +154,13 @@ bad_checks = 0
 global_step = 0
 stop_training = False
 
-for epoch in range(2):
+for epoch in range(1):
     model.train()
 
     for data in train_data:
         optimizer.zero_grad()
         logits = model(data)
-        loss = criterion(logits, data.edge_attr.float())
+        loss = criterion(logits, data.edge_y.float())
         loss.backward()
         optimizer.step()
 
@@ -169,12 +174,11 @@ for epoch in range(2):
             with torch.no_grad():
                 for val_batch in val_data:
                     val_logits = model(val_batch)
-                    val_loss = criterion(val_logits, val_batch.edge_attr.float())
+                    val_loss = criterion(val_logits, val_batch.edge_y.float())
                     val_loss_sum += val_loss.item()
                     val_count += 1
 
             mean_val_loss = val_loss_sum / max(val_count, 1)
-            print(f"step={global_step}, val_loss={mean_val_loss:.4f}")
 
             if mean_val_loss < best_val_loss - min_delta:
                 best_val_loss = mean_val_loss
@@ -203,14 +207,15 @@ total_edges = 0
 with torch.no_grad():
     for data in val_data:
         logits = model(data)
-        loss = criterion(logits, data.edge_attr.float())
+        loss = criterion(logits, data.edge_y.float())
 
-        total_loss += loss.item() * data.edge_attr.numel()
-        total_edges += data.edge_attr.numel()
+        total_loss += loss.item() * data.edge_y.numel()
+        total_edges += data.edge_y.numel()
 
 avg_loss = total_loss / total_edges if total_edges > 0 else 0
 print(avg_loss)
 
+#group_size = 10
 proba = data_generator.generate_graph(group_size)
 sel_nodes = proba.nodes
 proba = data_generator.graph_to_pyg_data(proba,group_size,verbose=True)
