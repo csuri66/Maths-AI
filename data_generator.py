@@ -73,7 +73,7 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         prefs_for_gale = list(range(group_size,group_size*2))
         random.shuffle(prefs_for_gale)
         prefs_for_model = [x - group_size for x in prefs_for_gale]
-        edge_weight += [10 - x for x in prefs_for_model]
+        edge_weight += [group_size - x for x in prefs_for_model]
         x.append(prefs_for_model)
         proposer_pref[node] = prefs_for_gale
 
@@ -82,15 +82,18 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         prefs_for_gale = list(range(group_size))
         random.shuffle(prefs_for_gale)
         prefs_for_model = prefs_for_gale
+        temp += [group_size - x for x in prefs_for_model]
 
-        temp += [10 - x for x in prefs_for_model]
         edge_weight= list(chain(*zip(temp, edge_weight)))
         x.append(prefs_for_model)
         proposee_pref[node] = prefs_for_gale
-
+    e_w = []
+    for i in range(0,len(edge_weight),2):
+        e_w.append(edge_weight[i] + edge_weight[i+1])
+    edge_weight=e_w
     edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
-    look=1*group_size
+    look=group_size
     who_am_i=0
     where_am_i =0
     x_final = []
@@ -101,11 +104,12 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=1*group_size
+                x_final[who_am_i][0]  +=1
             x_final[who_am_i][1]+=x[look].index(who_am_i)+1
             look+=1
         where_am_i+=1
         who_am_i+=1
+
 
     look = 0
     who_am_i = 0
@@ -117,18 +121,18 @@ def graph_to_pyg_data(G, group_size,verbose=False):
         x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
-                x_final[where_am_i][0] += 1 *group_size
+                x_final[where_am_i][0] += 1
             x_final[where_am_i][1] += x[look].index(who_am_i)+1
             look += 1
         where_am_i+=1
         who_am_i += 1
 
 
+
     edges = []
     for u, v in G.edges():
         ui, vi = node_id_map[u], node_id_map[v]
         edges.append([ui, vi])
-        edges.append([vi, ui])
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
 
@@ -140,16 +144,13 @@ def graph_to_pyg_data(G, group_size,verbose=False):
             print(line)
         print("Optimal matching")
         print(is_stable_matching(matching, proposer_pref, proposee_pref))
-        print(x_final)
         print(matching)
     e_attr= []
 
     for u,v in G.edges():
-        if (u in matching and matching[u] == v) or (v in matching and matching[v] == u):
-            e_attr.append(1)
+        if u in matching and matching[u] == v:
             e_attr.append(1)
         else:
-            e_attr.append(0)
             e_attr.append(0)
     edge_attr = torch.tensor(e_attr, dtype=torch.float)
     data_x = torch.tensor(x_final, dtype=torch.float)
