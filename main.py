@@ -4,6 +4,7 @@ import GAT
 import data_generator
 import networkx as nx
 import torch.nn.functional as F
+import copy
 
 def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
     selected_nodes = list(selected_nodes)
@@ -191,9 +192,9 @@ def train(global_step,best_val_loss,stop_training):
                 rank_dst=rank_dst,
                 n_left=group_size,
                 n_right=group_size,
-                lambda_match=1.0,
-                lambda_stab=0.1,
-                tau=0.2
+                lambda_match=0.5,
+                lambda_stab=0.5,
+                tau=0.1
             )
             loss = loss_dict
             loss.backward()
@@ -240,10 +241,10 @@ def train(global_step,best_val_loss,stop_training):
                             n_left=group_size,
                             n_right=group_size,
                             lambda_match=1,
-                            lambda_stab=1.0,
+                            lambda_stab=0.1,
                             tau=0.3
                         )
-                        val_loss_sum += val_loss.item()
+                        val_loss_sum += val_loss
                         val_count += 1
 
                 mean_val_loss = val_loss_sum / max(val_count, 1)
@@ -261,9 +262,122 @@ def train(global_step,best_val_loss,stop_training):
                     print("Early stopping")
                     stop_training = True
                     break
-
         if stop_training:
             break
+
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_val_loss = float("inf")
+        self.counter = 0
+        self.best_state = None
+        self.should_stop = False
+
+    def step(self, val_loss, model):
+        if val_loss < self.best_val_loss - self.min_delta:
+            self.best_val_loss = val_loss
+            self.counter = 0
+            self.best_state = copy.deepcopy(model.state_dict())
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+
+        return self.should_stop
+
+
+
+def train_with_early_stopping(train_data,val_data,model):
+    early_stopper = EarlyStopping(patience=10, min_delta=1e-5)
+    for epoch in range(20000):
+        model.train()
+        optimizer.zero_grad()
+        src_global = train_data.edge_index[0]
+        dst_global = train_data.edge_index[1]
+        dst_local = train_data.edge_index[1] - group_size
+        proposer_rank = {
+            u: {partner: rank for rank, partner in enumerate(pref_list)}
+            for u, pref_list in train_data.proposer_pref.items()
+        }
+        proposee_rank = {
+            u: {partner: rank for rank, partner in enumerate(pref_list)}
+            for u, pref_list in train_data.proposee_pref.items()
+        }
+        rank_src = torch.tensor(
+            [proposer_rank[int(u)][int(vg)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
+            dtype=torch.float,
+            device=src_global.device
+        )
+        rank_dst = torch.tensor(
+            [proposee_rank[int(vg)][int(u)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
+            dtype=torch.float,
+            device=src_global.device
+        )
+        logits = model(train_data)
+        train_loss = stable_matching_loss(
+            logits=logits,
+            edge_label=train_data.edge_y.float(),
+            src=src_global,
+            dst=dst_local,
+            rank_src=rank_src,
+            rank_dst=rank_dst,
+            n_left=group_size,
+            n_right=group_size,
+            lambda_match=0.5,
+            lambda_stab=0.5,
+            tau=0.3
+        )
+
+        train_loss.backward()
+        optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_logits = model(val_data)
+            src_global = val_data.edge_index[0]
+            dst_global = val_data.edge_index[1]
+            dst_local = val_data.edge_index[1] - group_size
+            proposer_rank = {
+                u: {partner: rank for rank, partner in enumerate(pref_list)}
+                for u, pref_list in train_data.proposer_pref.items()
+            }
+            proposee_rank = {
+                u: {partner: rank for rank, partner in enumerate(pref_list)}
+                for u, pref_list in train_data.proposee_pref.items()
+            }
+            rank_src = torch.tensor(
+                [proposer_rank[int(u)][int(vg)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
+                dtype=torch.float,
+                device=src_global.device
+            )
+            rank_dst = torch.tensor(
+                [proposee_rank[int(vg)][int(u)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
+                dtype=torch.float,
+                device=src_global.device
+            )
+            val_loss = stable_matching_loss(
+                logits=val_logits,
+                edge_label=val_data.edge_y.float(),
+                src=src_global,
+                dst=dst_local,
+                rank_src=rank_src,
+                rank_dst=rank_dst,
+                n_left=group_size,
+                n_right=group_size,
+                lambda_match=0.5,
+                lambda_stab=0.5,
+                tau=0.3
+            )
+
+        stop = early_stopper.step(val_loss.item(), model)
+
+        if stop:
+            print("Early stopping triggered.")
+            break
+
+    model.load_state_dict(early_stopper.best_state)
 
 
 group_size=10
@@ -271,23 +385,23 @@ group_size=10
 raw_train_graphs =[]
 
 # Tanító
-for i in range(4000):
+for i in range(1):
     raw_train_graphs.append(data_generator.generate_graph(group_size))
 
 train_data = []
 for graph in raw_train_graphs:
-    train_data.append(data_generator.graph_to_pyg_data(graph,group_size))
+    train_data.append(data_generator.graph_to_pyg_data(graph,group_size,verbose=True))
 
 # Validációs
 val_graphs = []
-for i in range(500):
+for i in range(1):
     val_graphs.append(data_generator.generate_graph(group_size))
 
 val_data = []
 for graph in val_graphs:
     val_data.append(data_generator.graph_to_pyg_data(graph,group_size))
 
-
+"""
 all_train_x = torch.cat([g.x for g in train_data], dim=0)
 all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
 
@@ -304,19 +418,20 @@ for g in train_data:
 for g in val_data:
     g.x = (g.x - mean) / std
     g.edge_attr = (g.edge_attr - mean_edge) / std_edge
-
+"""
 
 model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 pos = sum(data.edge_y.sum().item() for data in train_data)
 total = sum(data.edge_y.numel() for data in train_data)
 neg = total - pos
 pos_weight = torch.tensor(neg/pos, dtype=torch.float)
 
 
+
+"""
 patience_counter = 0
 best_path = "best_model.pt"
-
 patience = 30
 min_delta = 1e-4
 eval_every = 10
@@ -325,10 +440,10 @@ best_val_loss = float("inf")
 bad_checks = 0
 global_step = 0
 stop_training = False
+"""
+train_with_early_stopping(train_data[0],val_data[0],model)
 
-train(global_step,best_val_loss,stop_training)
-
-model.load_state_dict(torch.load("best_model.pt", weights_only=True))
+#model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 
 
 
@@ -376,8 +491,10 @@ bad = 0
 for i in range(1000):
     acc_graph = data_generator.generate_graph(group_size)
     acc_data = data_generator.graph_to_pyg_data(acc_graph,group_size)
+    """
     acc_data.x = (acc_data.x - mean) / std
     acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
+    """
     logits = model(acc_data)
     probs = torch.sigmoid(logits)
     pairs, unmatched = best_pairing_for_selected_nodes(

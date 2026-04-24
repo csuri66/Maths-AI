@@ -6,12 +6,12 @@ from torch_geometric.nn import GATv2Conv
 class GATEdgeClassifier(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super().__init__()
-        self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=3,edge_dim=1,concat=False)
+        self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=1,edge_dim=1,concat=False)
         self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
         self.conv2 = GATv2Conv(
             hidden_channels,
             hidden_channels,
-            heads=3,
+            heads=1,
             edge_dim=1,
             concat=False
         )

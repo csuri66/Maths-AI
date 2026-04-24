@@ -1,3 +1,3 @@
-Modell revision
-Train data revision: több matching ha van
-Loss revision
+
+Train data revision: esetek választása
+Ugyan olyan, egyel tolt, forditott, dominans, nehez verseny, konnyu verseny
