@@ -1,3 +1,4 @@
+import random
 
 import torch
 import GAT
@@ -110,6 +111,7 @@ def soft_current_rank(probs, node_index, edge_rank, num_nodes):
     return current_rank, mass
 
 
+
 def stable_matching_loss(
     logits,          # [E]
     edge_label,      # [E] 0/1
@@ -156,7 +158,7 @@ def stable_matching_loss(
 
 
 def train(global_step,best_val_loss,stop_training):
-    for epoch in range(1):
+    for epoch in range(500):
         model.train()
 
         for data in train_data:
@@ -192,7 +194,7 @@ def train(global_step,best_val_loss,stop_training):
                 rank_dst=rank_dst,
                 n_left=group_size,
                 n_right=group_size,
-                lambda_match=0.5,
+                lambda_match=0.8,
                 lambda_stab=0.5,
                 tau=0.1
             )
@@ -240,7 +242,7 @@ def train(global_step,best_val_loss,stop_training):
                             rank_dst=rank_dst,
                             n_left=group_size,
                             n_right=group_size,
-                            lambda_match=1,
+                            lambda_match=0.1,
                             lambda_stab=0.1,
                             tau=0.3
                         )
@@ -264,6 +266,7 @@ def train(global_step,best_val_loss,stop_training):
                     break
         if stop_training:
             break
+
 
 
 class EarlyStopping:
@@ -382,26 +385,50 @@ def train_with_early_stopping(train_data,val_data,model):
 
 group_size=10
 
-raw_train_graphs =[]
-
-# Tanító
-for i in range(1):
-    raw_train_graphs.append(data_generator.generate_graph(group_size))
 
 train_data = []
-for graph in raw_train_graphs:
-    train_data.append(data_generator.graph_to_pyg_data(graph,group_size,verbose=True))
+
+# Tanító
+"""
+for i in range(300):
+    train_data.append(data_generator.graph_to_pyg_data_random(data_generator.generate_graph(group_size), group_size))
+"""
+"""
+for i in range(100):
+    train_data.append(data_generator.graph_to_pyg_data_reverse(data_generator.generate_graph(group_size), group_size))
+"""
+for i in range(12):
+    train_data.append(data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph(group_size), group_size))
+
+
+for i in range(6):
+    train_data.append(data_generator.graph_to_pyg_data_dominant_proposee(data_generator.generate_graph(group_size), group_size))
+
+for i in range(6):
+    train_data.append(data_generator.graph_to_pyg_data_dominant_proposer(data_generator.generate_graph(group_size), group_size))
+"""
+for i in range(50):
+    train_data.append(data_generator.graph_to_pyg_data_trivial(data_generator.generate_graph(group_size), group_size))
+"""
+for i in range(2):
+    train_data.append(data_generator.graph_to_pyg_data_offset(data_generator.generate_graph(group_size), group_size))
+
+for i in range(12):
+    train_data.append(data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph(group_size), group_size))
+
+
+
 
 # Validációs
 val_graphs = []
-for i in range(1):
+for i in range(100):
     val_graphs.append(data_generator.generate_graph(group_size))
 
 val_data = []
 for graph in val_graphs:
-    val_data.append(data_generator.graph_to_pyg_data(graph,group_size))
+    val_data.append(data_generator.graph_to_pyg_data_random(graph,group_size))
 
-"""
+
 all_train_x = torch.cat([g.x for g in train_data], dim=0)
 all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
 
@@ -418,10 +445,10 @@ for g in train_data:
 for g in val_data:
     g.x = (g.x - mean) / std
     g.edge_attr = (g.edge_attr - mean_edge) / std_edge
-"""
+
 
 model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
 pos = sum(data.edge_y.sum().item() for data in train_data)
 total = sum(data.edge_y.numel() for data in train_data)
 neg = total - pos
@@ -429,7 +456,7 @@ pos_weight = torch.tensor(neg/pos, dtype=torch.float)
 
 
 
-"""
+
 patience_counter = 0
 best_path = "best_model.pt"
 patience = 30
@@ -440,10 +467,10 @@ best_val_loss = float("inf")
 bad_checks = 0
 global_step = 0
 stop_training = False
-"""
-train_with_early_stopping(train_data[0],val_data[0],model)
 
-#model.load_state_dict(torch.load("best_model.pt", weights_only=True))
+#train(global_step,best_val_loss,stop_training)
+
+model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 
 
 
@@ -461,7 +488,7 @@ with torch.no_grad():
 avg_loss = total_loss / total_edges if total_edges > 0 else 0
 print(avg_loss)"""
 
-group_size = 3
+group_size = 5
 #proba = data_generator.generate_graph(group_size)
 #sel_nodes = proba.nodes
 #proba = data_generator.graph_to_pyg_data(proba,group_size,verbose=True)
@@ -490,11 +517,9 @@ good = 0
 bad = 0
 for i in range(1000):
     acc_graph = data_generator.generate_graph(group_size)
-    acc_data = data_generator.graph_to_pyg_data(acc_graph,group_size)
-    """
+    acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
     acc_data.x = (acc_data.x - mean) / std
     acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
-    """
     logits = model(acc_data)
     probs = torch.sigmoid(logits)
     pairs, unmatched = best_pairing_for_selected_nodes(
@@ -502,10 +527,10 @@ for i in range(1000):
         edge_index=acc_data.edge_index,
         edge_probs=probs
     )
-    pair_dict= {}
+    pair_dict = {}
     for u, v, p, edge_idx in pairs:
-        pair_dict[u]=v
-    if is_stable_matching(pair_dict,acc_data.proposer_pref,acc_data.proposee_pref):
+        pair_dict[u] = v
+    if is_stable_matching(pair_dict, acc_data.proposer_pref, acc_data.proposee_pref):
         good += 1
     else:
         bad += 1
