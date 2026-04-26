@@ -101,9 +101,12 @@ def graph_to_pyg_data_random(G, group_size,verbose=False):
         x_final.append([])
         x_final[who_am_i].append(0)
         x_final[who_am_i].append(0)
+        x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
                 x_final[who_am_i][0]  +=10
+            if x[look][-1] == who_am_i:
+                x_final[who_am_i][2] -=10
             x_final[who_am_i][1]-=x[look].index(who_am_i)+1
             look+=1
         where_am_i+=1
@@ -118,9 +121,12 @@ def graph_to_pyg_data_random(G, group_size,verbose=False):
         x_final.append([])
         x_final[where_am_i].append(0)
         x_final[where_am_i].append(0)
+        x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
                 x_final[where_am_i][0] += 10
+            if x[look][-1] == who_am_i:
+                x_final[where_am_i][2] -=10
             x_final[where_am_i][1] -= x[look].index(who_am_i)+1
             look += 1
         where_am_i+=1
@@ -294,6 +300,7 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
         random.shuffle(prefs_for_gale)
         if noDominant:
             dominant = prefs_for_gale[0]
+            noDominant = False
         else:
             prefs_for_gale.remove(dominant)
             prefs_for_gale.insert(0,dominant)
@@ -328,10 +335,13 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
         x_final.append([])
         x_final[who_am_i].append(0)
         x_final[who_am_i].append(0)
+        x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=10
-            x_final[who_am_i][1]-=x[look].index(who_am_i)+1
+                x_final[who_am_i][0]  +=10 *(group_size/2)
+            if x[look][-1] == who_am_i:
+                x_final[who_am_i][2] -=10 *(group_size/2)
+            x_final[who_am_i][1]-=x[look].index(who_am_i)+group_size
             look+=1
         where_am_i+=1
         who_am_i+=1
@@ -345,9 +355,12 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
         x_final.append([])
         x_final[where_am_i].append(0)
         x_final[where_am_i].append(0)
+        x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
                 x_final[where_am_i][0] += 10
+            if x[look][-1] == who_am_i:
+                x_final[where_am_i][2] -= 10
             x_final[where_am_i][1] -= x[look].index(who_am_i)+1
             look += 1
         where_am_i+=1
@@ -368,9 +381,8 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
     if(verbose):
         for line in x:
             print(line)
-        print("Optimal matching")
-        print(is_stable_matching(matching, proposer_pref, proposee_pref))
-        print(matching)
+        print("Data")
+        print(x_final)
     e_attr= []
 
     for u,v in G.edges():
@@ -423,6 +435,7 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
         random.shuffle(prefs_for_gale)
         if noDominant:
             dominant = prefs_for_gale[0]
+            noDominant = False
         else:
             prefs_for_gale.remove(dominant)
             prefs_for_gale.insert(0,dominant)
@@ -448,9 +461,12 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
         x_final.append([])
         x_final[who_am_i].append(0)
         x_final[who_am_i].append(0)
+        x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
                 x_final[who_am_i][0]  +=10
+            if x[look][-1] == who_am_i:
+                x_final[who_am_i][2] -=10
             x_final[who_am_i][1]-=x[look].index(who_am_i)+1
             look+=1
         where_am_i+=1
@@ -465,9 +481,12 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
         x_final.append([])
         x_final[where_am_i].append(0)
         x_final[where_am_i].append(0)
+        x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
                 x_final[where_am_i][0] += 10
+            if x[look][-1] == who_am_i:
+                x_final[where_am_i][2] -=10
             x_final[where_am_i][1] -= x[look].index(who_am_i)+1
             look += 1
         where_am_i+=1
@@ -488,9 +507,8 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
     if(verbose):
         for line in x:
             print(line)
-        print("Optimal matching")
-        print(is_stable_matching(matching, proposer_pref, proposee_pref))
-        print(matching)
+        print("Data")
+        print(x_final)
     e_attr= []
 
     for u,v in G.edges():
@@ -792,9 +810,12 @@ def graph_to_pyg_data_low_diff(G, group_size,verbose=False):
         x_final.append([])
         x_final[who_am_i].append(0)
         x_final[who_am_i].append(0)
+        x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
                 x_final[who_am_i][0]  +=10
+            if x[look][-1] == who_am_i:
+                x_final[who_am_i][2] -=10
             x_final[who_am_i][1]-=x[look].index(who_am_i)+1
             look+=1
         where_am_i+=1
@@ -809,9 +830,12 @@ def graph_to_pyg_data_low_diff(G, group_size,verbose=False):
         x_final.append([])
         x_final[where_am_i].append(0)
         x_final[where_am_i].append(0)
+        x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
                 x_final[where_am_i][0] += 10
+            if x[look][-1] == who_am_i:
+                x_final[where_am_i][2] -=10
             x_final[where_am_i][1] -= x[look].index(who_am_i)+1
             look += 1
         where_am_i+=1
@@ -907,9 +931,12 @@ def graph_to_pyg_data_high_diff(G, group_size,verbose=False):
         x_final.append([])
         x_final[who_am_i].append(0)
         x_final[who_am_i].append(0)
+        x_final[who_am_i].append(0)
         for node2 in set2:
             if x[look][0] == who_am_i:
                 x_final[who_am_i][0]  +=10
+            if x[look][-1] == who_am_i:
+                x_final[who_am_i][2] -=10
             x_final[who_am_i][1]-=x[look].index(who_am_i)+1
             look+=1
         where_am_i+=1
@@ -924,9 +951,12 @@ def graph_to_pyg_data_high_diff(G, group_size,verbose=False):
         x_final.append([])
         x_final[where_am_i].append(0)
         x_final[where_am_i].append(0)
+        x_final[where_am_i].append(0)
         for node2 in set1:
             if x[look][0] == who_am_i:
                 x_final[where_am_i][0] += 10
+            if x[look][-1] == who_am_i:
+                x_final[where_am_i][2] -=10
             x_final[where_am_i][1] -= x[look].index(who_am_i)+1
             look += 1
         where_am_i+=1

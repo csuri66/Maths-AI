@@ -113,12 +113,12 @@ def soft_current_rank(probs, node_index, edge_rank, num_nodes):
 
 
 def stable_matching_loss(
-    logits,          # [E]
-    edge_label,      # [E] 0/1
-    src,             # [E] bal oldali csúcs indexe: 0..n_left-1
-    dst,             # [E] jobb oldali csúcs indexe: 0..n_right-1
-    rank_src,        # [E] src oldali preferenciarang az adott élre
-    rank_dst,        # [E] dst oldali preferenciarang az adott élre
+    logits,
+    edge_label,
+    src,
+    dst,
+    rank_src,
+    rank_dst,
     n_left,
     n_right,
     lambda_match,
@@ -128,7 +128,7 @@ def stable_matching_loss(
     probs = torch.sigmoid(logits)
 
     loss_edge = F.binary_cross_entropy_with_logits(
-            logits, edge_label, pos_weight=pos_weight
+            logits, edge_label
     )
 
 
@@ -157,7 +157,7 @@ def stable_matching_loss(
 
 
 
-def train(global_step,best_val_loss,stop_training):
+def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau):
     for epoch in range(500):
         model.train()
 
@@ -194,9 +194,9 @@ def train(global_step,best_val_loss,stop_training):
                 rank_dst=rank_dst,
                 n_left=group_size,
                 n_right=group_size,
-                lambda_match=0.8,
-                lambda_stab=0.5,
-                tau=0.1
+                lambda_match=lambda_match,
+                lambda_stab=lambda_stab,
+                tau=tau
             )
             loss = loss_dict
             loss.backward()
@@ -242,9 +242,9 @@ def train(global_step,best_val_loss,stop_training):
                             rank_dst=rank_dst,
                             n_left=group_size,
                             n_right=group_size,
-                            lambda_match=0.1,
-                            lambda_stab=0.1,
-                            tau=0.3
+                            lambda_match=lambda_match,
+                            lambda_stab=lambda_stab,
+                            tau=tau
                         )
                         val_loss_sum += val_loss
                         val_count += 1
@@ -265,6 +265,8 @@ def train(global_step,best_val_loss,stop_training):
                     stop_training = True
                     break
         if stop_training:
+            print(global_step)
+            print(best_val_loss)
             break
 
 
@@ -383,7 +385,7 @@ def train_with_early_stopping(train_data,val_data,model):
     model.load_state_dict(early_stopper.best_state)
 
 
-group_size=10
+group_size=3
 
 
 train_data = []
@@ -400,24 +402,14 @@ for i in range(100):
 for i in range(12):
     train_data.append(data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph(group_size), group_size))
 
-
 for i in range(6):
     train_data.append(data_generator.graph_to_pyg_data_dominant_proposee(data_generator.generate_graph(group_size), group_size))
 
 for i in range(6):
     train_data.append(data_generator.graph_to_pyg_data_dominant_proposer(data_generator.generate_graph(group_size), group_size))
-"""
-for i in range(50):
-    train_data.append(data_generator.graph_to_pyg_data_trivial(data_generator.generate_graph(group_size), group_size))
-"""
-for i in range(2):
-    train_data.append(data_generator.graph_to_pyg_data_offset(data_generator.generate_graph(group_size), group_size))
 
 for i in range(12):
     train_data.append(data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph(group_size), group_size))
-
-
-
 
 # Validációs
 val_graphs = []
@@ -468,54 +460,34 @@ bad_checks = 0
 global_step = 0
 stop_training = False
 
-#train(global_step,best_val_loss,stop_training)
+#train(global_step,best_val_loss,stop_training,0.8,0.4,0.05)
 
 model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 
 
 
 model.eval()
-"""total_loss = 0
+"""
+total_loss = 0
 total_edges = 0
 with torch.no_grad():
     for data in val_data:
         logits = model(data)
-        loss = criterion(logits, data.edge_y.float())
+        loss = F.binary_cross_entropy_with_logits(
+            logits, data.edge_y
+        )
 
         total_loss += loss.item() * data.edge_y.numel()
         total_edges += data.edge_y.numel()
 
 avg_loss = total_loss / total_edges if total_edges > 0 else 0
-print(avg_loss)"""
-
+print(avg_loss)
+"""
 group_size = 5
-#proba = data_generator.generate_graph(group_size)
-#sel_nodes = proba.nodes
-#proba = data_generator.graph_to_pyg_data(proba,group_size,verbose=True)
-#proba_logits = model(proba)
-#probs = torch.sigmoid(proba_logits)
-#print(probs)
 
-#proba.x =(proba.x - mean) / std
-
-
-#pairs, unmatched = best_pairing_for_selected_nodes(
-    #selected_nodes=sel_nodes,
-    #edge_index=proba.edge_index,
-    #edge_probs=probs
-#)
-
-#print("Kiválasztott párok:")
-#pair_dict= {}
-#for u, v, p, best_dir, edge_idx in pairs:
-    #pair_dict[u]=v
-    #print(f"{u} -- {v} | p={p:.4f}  | edge_idx={edge_idx}")
-
-#print("Pár nélkül maradt csúcsok:", unmatched)
-#print(is_stable_matching(pair_dict,proba.proposer_pref,proba.proposee_pref))
 good = 0
 bad = 0
-for i in range(1000):
+for i in range(5000):
     acc_graph = data_generator.generate_graph(group_size)
     acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
     acc_data.x = (acc_data.x - mean) / std

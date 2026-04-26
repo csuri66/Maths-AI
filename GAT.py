@@ -4,26 +4,44 @@ from torch_geometric.nn import GATv2Conv
 
 
 class GATEdgeClassifier(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels):
+    def __init__(self, in_channels, hidden_channels, dropout=0.5):
         super().__init__()
-        self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=3,edge_dim=1,concat=False)
+
+        self.conv1 = GATv2Conv(
+            in_channels,
+            hidden_channels,
+            heads=3,
+            edge_dim=1,
+            concat=False,
+            dropout=dropout
+        )
         self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
+        self.norm1 = torch.nn.LayerNorm(hidden_channels)
+
         self.conv2 = GATv2Conv(
             hidden_channels,
             hidden_channels,
             heads=3,
             edge_dim=1,
-            concat=False
+            concat=False,
+            dropout=dropout
         )
         self.skip2 = torch.nn.Linear(hidden_channels, hidden_channels)
+        self.norm2 = torch.nn.LayerNorm(hidden_channels)
+
         self.edge_mlp = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels * 2, hidden_channels),
+            torch.nn.Linear(hidden_channels * 4 + 1, hidden_channels),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_channels, 1)
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_channels // 2, 1)
         )
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
+
         edge_attr = torch.as_tensor(
             data.edge_attr,
             dtype=torch.float,
@@ -32,14 +50,28 @@ class GATEdgeClassifier(torch.nn.Module):
 
         x0 = x
         x = self.conv1(x, edge_index, edge_attr)
-        x = F.relu(x + self.skip1(x0))
+        x = x + self.skip1(x0)
+        x = self.norm1(x)
+        x = F.elu(x)
 
         x1 = x
         x = self.conv2(x, edge_index, edge_attr)
-        x = F.relu(x + self.skip2(x1))
+        x = x + self.skip2(x1)
+        x = self.norm2(x)
+        x = F.elu(x)
 
         src, dst = edge_index
-        edge_emb = torch.cat([x[src], x[dst]], dim=-1)
+
+        x_src = x[src]
+        x_dst = x[dst]
+        x_diff = torch.abs(x_src - x_dst)
+        x_mul = x_src * x_dst
+
+        edge_emb = torch.cat(
+            [x_src, x_dst, x_diff, x_mul, edge_attr],
+            dim=-1
+        )
+
         logits = self.edge_mlp(edge_emb).squeeze(-1)
         return logits
 
