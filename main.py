@@ -93,11 +93,7 @@ def scatter_sum_1d(values, index, n):
 
 
 def soft_current_rank(probs, node_index, edge_rank, num_nodes):
-    """
-    probs:     [E]    sigmoid(logits), 0..1
-    node_index:[E]    melyik csúcshoz tartozik az él ezen az oldalon
-    edge_rank: [E]    kisebb = jobb partner
-    """
+
     mass = scatter_sum_1d(probs, node_index, num_nodes)
 
     deg = scatter_sum_1d(torch.ones_like(probs), node_index, num_nodes)
@@ -391,14 +387,7 @@ group_size=3
 train_data = []
 
 # Tanító
-"""
-for i in range(300):
-    train_data.append(data_generator.graph_to_pyg_data_random(data_generator.generate_graph(group_size), group_size))
-"""
-"""
-for i in range(100):
-    train_data.append(data_generator.graph_to_pyg_data_reverse(data_generator.generate_graph(group_size), group_size))
-"""
+
 for i in range(12):
     train_data.append(data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph(group_size), group_size))
 
@@ -483,7 +472,7 @@ with torch.no_grad():
 avg_loss = total_loss / total_edges if total_edges > 0 else 0
 print(avg_loss)
 """
-group_size = 5
+group_size = 3
 
 good = 0
 bad = 0
