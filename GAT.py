@@ -4,37 +4,35 @@ from torch_geometric.nn import GATv2Conv
 
 
 class GATEdgeClassifier(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, dropout=0.5):
+    def __init__(self, in_channels, hidden_channels, dropout=0.7):
         super().__init__()
 
         self.conv1 = GATv2Conv(
             in_channels,
             hidden_channels,
-            heads=3,
+            heads=8,
             edge_dim=1,
             concat=False,
             dropout=dropout
         )
         self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
-        self.norm1 = torch.nn.LayerNorm(hidden_channels)
 
         self.conv2 = GATv2Conv(
             hidden_channels,
             hidden_channels,
-            heads=3,
+            heads=8,
             edge_dim=1,
             concat=False,
             dropout=dropout
         )
         self.skip2 = torch.nn.Linear(hidden_channels, hidden_channels)
-        self.norm2 = torch.nn.LayerNorm(hidden_channels)
 
         self.edge_mlp = torch.nn.Sequential(
             torch.nn.Linear(hidden_channels * 4 + 1, hidden_channels),
-            torch.nn.ReLU(),
+            torch.nn.Tanh(),
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.ReLU(),
+            torch.nn.Tanh(),
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_channels // 2, 1)
         )
@@ -51,13 +49,11 @@ class GATEdgeClassifier(torch.nn.Module):
         x0 = x
         x = self.conv1(x, edge_index, edge_attr)
         x = x + self.skip1(x0)
-        x = self.norm1(x)
         x = F.elu(x)
 
         x1 = x
         x = self.conv2(x, edge_index, edge_attr)
         x = x + self.skip2(x1)
-        x = self.norm2(x)
         x = F.elu(x)
 
         src, dst = edge_index

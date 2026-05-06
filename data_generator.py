@@ -54,6 +54,19 @@ def is_stable_matching(match_a, prefs_a, prefs_b):
 
     return len(blocking_pairs) == 0, blocking_pairs
 
+def graph_to_pyg_data_with_prefs(data_x,edge_index,edge_weight,edge_attr,proposee_pref,proposer_pref):
+    data = Data(
+        x=data_x,
+        edge_index=edge_index,
+        edge_attr=edge_weight,
+        edge_y=edge_attr,
+        proposee_pref=proposee_pref,
+        proposer_pref=proposer_pref
+    )
+    return data
+
+
+
 def graph_to_pyg_data_random(G, group_size,verbose=False):
 
     nodes = list(G.nodes())
