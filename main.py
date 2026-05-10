@@ -1,54 +1,12 @@
-import random
 
 import torch
 from torch_geometric.data import Data
-
 import GAT
 import data_generator
-import networkx as nx
 import torch.nn.functional as F
-import ast
+import gale_shapley
+import random
 
-def best_pairing_for_selected_nodes(selected_nodes, edge_index, edge_probs):
-    selected_nodes = list(selected_nodes)
-    selected_set = set(selected_nodes)
-
-    ei = edge_index.detach().cpu()
-    probs = edge_probs.detach().cpu().view(-1)
-
-    G = nx.Graph()
-    G.add_nodes_from(selected_nodes)
-
-    E = ei.size(1)
-    for e in range(E):
-        src = int(ei[0, e].item())
-        dst = int(ei[1, e].item())
-
-        if src not in selected_set or dst not in selected_set:
-            continue
-        if src == dst:
-            continue
-
-        p = float(probs[e].item())
-
-        G.add_edge(src, dst, weight=p, edge_idx=e)
-
-    matching = nx.max_weight_matching(G, maxcardinality=True, weight="weight")
-
-    matching_edges = []
-    used_nodes = set()
-
-    for u, v in matching:
-        a, b = sorted((u, v))
-        data = G[a][b]
-        matching_edges.append((a, b, data["weight"], data["edge_idx"]))
-        used_nodes.add(a)
-        used_nodes.add(b)
-
-    unmatched = [n for n in selected_nodes if n not in used_nodes]
-
-    matching_edges.sort(key=lambda x: (x[0], x[1]))
-    return matching_edges, unmatched
 def build_current_data_from_original(original_data, remaining_orig_ids):
     device = original_data.x.device
     num_nodes = original_data.x.size(0)
@@ -128,6 +86,7 @@ def best_pairing_for_selected_node(selected_nodes, edge_index, edge_probs):
         return None, None, None
 
     return best_e, (best_src, best_dst)
+
 def filter_node_field(field, keep_node_mask, old_to_new=None):
     if field is None:
         return None
@@ -185,48 +144,10 @@ def remove_best_pair_from_data(data, best_src, best_dst):
 
     return new_data, removed_original
 
-def is_stable_matching(match_a, prefs_a, prefs_b):
-
-    match_b = {b: a for a, b in match_a.items() if b is not None}
-
-    rank_a = {
-        a: {b: i for i, b in enumerate(pref_list)}
-        for a, pref_list in prefs_a.items()
-    }
-    rank_b = {
-        b: {a: i for i, a in enumerate(pref_list)}
-        for b, pref_list in prefs_b.items()
-    }
-
-    blocking_pairs = []
-
-    for a in prefs_a:
-        current_b = match_a.get(a, None)
-
-        for b in prefs_a[a]:
-            if current_b == b:
-                continue
-
-            current_a_for_b = match_b.get(b, None)
-
-            a_prefers_b = (
-                current_b is None or rank_a[a][b] < rank_a[a][current_b]
-            )
-            b_prefers_a = (
-                current_a_for_b is None or rank_b[b][a] < rank_b[b][current_a_for_b]
-            )
-
-            if a_prefers_b and b_prefers_a:
-                blocking_pairs.append((a, b))
-
-    return len(blocking_pairs) == 0
-
-
 def scatter_sum_1d(values, index, n):
     out = values.new_zeros(n)
     out.index_add_(0, index, values)
     return out
-
 
 def soft_current_rank(probs, node_index, edge_rank, num_nodes):
 
@@ -242,8 +163,6 @@ def soft_current_rank(probs, node_index, edge_rank, num_nodes):
     current_rank = (weighted_rank + unmatched_mass * unmatched_rank) / denom
     return current_rank, mass
 
-
-
 def stable_matching_loss(
     logits,
     edge_label,
@@ -255,7 +174,8 @@ def stable_matching_loss(
     n_right,
     lambda_match,
     lambda_stab,
-    tau
+    tau,
+    pos_weight
 ):
     probs = torch.sigmoid(logits)
 
@@ -289,7 +209,7 @@ def stable_matching_loss(
 
 
 
-def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau):
+def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,model,optimizer,train_data,group_size,eval_every,val_data,patience,min_delta,pos_weight):
     for epoch in range(500):
         model.train()
 
@@ -317,7 +237,7 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau):
                 dtype=torch.float,
                 device=src_global.device
             )
-            loss_dict = stable_matching_loss(
+            loss = stable_matching_loss(
                 logits=logits,
                 edge_label=data.edge_y.float(),
                 src=src_global,
@@ -328,9 +248,9 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau):
                 n_right=group_size,
                 lambda_match=lambda_match,
                 lambda_stab=lambda_stab,
-                tau=tau
+                tau=tau,
+                pos_weight=pos_weight
             )
-            loss = loss_dict
             loss.backward()
             optimizer.step()
 
@@ -376,7 +296,8 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau):
                             n_right=group_size,
                             lambda_match=lambda_match,
                             lambda_stab=lambda_stab,
-                            tau=tau
+                            tau=tau,
+                            pos_weight=pos_weight
                         )
                         val_loss_sum += val_loss
                         val_count += 1
@@ -402,191 +323,162 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau):
             print(best_val_loss)
             break
     return best_val_loss
-train_data = []
-
-group_size=3
 
 
 
-# Tanító
-for j in range(300):
-    for i in range(1):
-        train_data.append(data_generator.graph_to_pyg_data_random(data_generator.generate_graph(group_size), group_size))
+def main(training=False):
+
+    group_size=3
+
+    train_data = []
+    for j in range(200):
+        train_data.append(
+            data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph_m(group_size), group_size))
+        train_data.append(
+            data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph_m(group_size), group_size))
 
 
-
-
-val_data = []
-
-for i in range(10):
-    for i in range(10):
+    val_data = []
+    for i in range(100):
         val_data.append(
-            data_generator.graph_to_pyg_data_random(data_generator.generate_graph(group_size), group_size))
-test_data =[]
-
-for i in range(10):
-    for i in range(12):
-        test_data.append(
-            data_generator.graph_to_pyg_data_random(data_generator.generate_graph(group_size), group_size))
-all_train_x = torch.cat([g.x for g in train_data], dim=0)
-all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
-
-mean = all_train_x.mean(dim=0, keepdim=True)
-mean_edge = all_train_edge.mean(dim=0, keepdim=True)
-
-std = all_train_x.std(dim=0, keepdim=True)
-std_edge =  all_train_edge.std(dim=0, keepdim=True)
+            data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph_m(group_size), group_size))
+        val_data.append(
+            data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph_m(group_size), group_size))
 
 
 
 
-for g in train_data:
-    g.x = (g.x - mean) / std
-    g.edge_attr=(g.edge_attr - mean_edge) / std_edge
+    all_train_x = torch.cat([g.x for g in train_data], dim=0)
+    all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
 
-for g in val_data:
-    g.x = (g.x - mean) / std
-    g.edge_attr = (g.edge_attr - mean_edge) / std_edge
+    mean = all_train_x.mean(dim=0, keepdim=True)
+    mean_edge = all_train_edge.mean(dim=0, keepdim=True)
 
-for g in test_data:
-    g.x = (g.x - mean) / std
-    g.edge_attr = (g.edge_attr - mean_edge) / std_edge
-
-model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
-pos = sum(data.edge_y.sum().item() for data in train_data)
-total = sum(data.edge_y.numel() for data in train_data)
-neg = total - pos
-pos_weight = torch.tensor(neg/pos, dtype=torch.float)
+    std = all_train_x.std(dim=0, keepdim=True)
+    std_edge =  all_train_edge.std(dim=0, keepdim=True)
 
 
 
 
-patience_counter = 0
-best_path = "best_model.pt"
-patience = 10
-min_delta = 1e-6
-eval_every = 10
+    for g in train_data:
+        g.x = (g.x - mean) / std
+        g.edge_attr=(g.edge_attr - mean_edge) / std_edge
 
-best_val_loss = float("inf")
-bad_checks = 0
-global_step = 0
-stop_training = False
-
-matchL = 0
-matchS = 0
-t = 0
-"""
-while 1 > matchL and 1 > matchS and 1 > t:
-"""
-#train(global_step, best_val_loss, stop_training, 0.1, 0.1, 0.1)
-model.load_state_dict(torch.load("best_model.pt", weights_only=True))
+    for g in val_data:
+        g.x = (g.x - mean) / std
+        g.edge_attr = (g.edge_attr - mean_edge) / std_edge
 
 
-
-model.eval()
-"""
-total_loss = 0
-total_edges = 0
-with torch.no_grad():
-    for data in val_data:
-        logits = model(data)
-        loss = F.binary_cross_entropy_with_logits(
-            logits, data.edge_y
-        )
-
-        total_loss += loss.item() * data.edge_y.numel()
-        total_edges += data.edge_y.numel()
-
-avg_loss = total_loss / total_edges if total_edges > 0 else 0
-print("AVG edge loss on VAL")
-print(avg_loss)
-
-total_loss = 0
-total_edges = 0
-with torch.no_grad():
-    for data in test_data:
-        logits = model(data)
-        loss = F.binary_cross_entropy_with_logits(
-            logits, data.edge_y
-        )
-
-        total_loss += loss.item() * data.edge_y.numel()
-        total_edges += data.edge_y.numel()
-
-avg_loss = total_loss / total_edges if total_edges > 0 else 0
-print("AVG edge loss on TEST")
-print(avg_loss)
-"""
-group_size = 2
-good=0
-bad=0
-with torch.no_grad():
-    for i in range(1000):
-        pair_dict = {}
-        acc_graph = data_generator.generate_graph(group_size)
-        acc_data = data_generator.graph_to_pyg_data_random(acc_graph, group_size)
-        acc_data.x = (acc_data.x - mean) / std
-        acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
+    model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
+    optimizer = torch.optim.Adagrad(model.parameters(), lr=0.015)
+    pos = sum(data.edge_y.sum().item() for data in train_data)
+    total = sum(data.edge_y.numel() for data in train_data)
+    neg = total - pos
+    pos_weight = torch.tensor(neg/pos, dtype=torch.float)
 
 
-        logits = model(acc_data)
-        probs = torch.sigmoid(logits)
-        propr_pref=acc_data.proposer_pref
-        prope_pref = acc_data.proposee_pref
+    patience = 10
+    min_delta = 1e-4
+    eval_every = 10
 
-        current_data = acc_data
-        original_data = acc_data
-        if not hasattr(original_data, "orig_id") or original_data.orig_id is None:
-            original_data.orig_id = torch.arange(
-                original_data.x.size(0),
-                device=original_data.x.device
-            )
+    best_val_loss = float("inf")
+    global_step = 0
+    stop_training = False
 
-        remaining_orig_ids = original_data.orig_id.clone()
 
-        for i in range(group_size - 1):
+    if training:
+        train(global_step, best_val_loss, stop_training, 0.25, 0.45, 0.1,model,optimizer,train_data, group_size, eval_every, val_data, patience, min_delta,pos_weight)
+    model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 
-            current_data = build_current_data_from_original(
-                original_data,
-                remaining_orig_ids
-            )
 
-            if i == 0:
-                current_probs = probs
+
+    model.eval()
+
+    good=0
+    bad=0
+    with torch.no_grad():
+        for i in range(1000):
+
+            pair_dict = {}
+
+            group_size=random.randint(2,5)
+            acc_graph = data_generator.generate_graph_m(group_size)
+
+            structure = 0
+            num = structure %4
+            match num:
+                case 0:
+                    acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
+                case 1:
+                    acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
+                case 2:
+                    acc_data = data_generator.graph_to_pyg_data_dominant_proposer(acc_graph, group_size)
+                case 3:
+                    acc_data = data_generator.graph_to_pyg_data_dominant_proposee(acc_graph, group_size)
+
+            acc_data.x = (acc_data.x - mean) / std
+            acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
+
+            logits = model(acc_data)
+            probs = torch.sigmoid(logits)
+            propr_pref=acc_data.proposer_pref
+            prope_pref = acc_data.proposee_pref
+            original_data = acc_data
+            if not hasattr(original_data, "orig_id") or original_data.orig_id is None:
+                original_data.orig_id = torch.arange(
+                    original_data.x.size(0),
+                    device=original_data.x.device
+                )
+
+            remaining_orig_ids = original_data.orig_id.clone()
+
+            for i in range(group_size - 1):
+
+                current_data = build_current_data_from_original(
+                    original_data,
+                    remaining_orig_ids
+                )
+
+                if i == 0:
+                    current_probs = probs
+                else:
+                    logits = model(current_data)
+                    current_probs = torch.sigmoid(logits)
+                best_e, (best_src, best_dst) = best_pairing_for_selected_node(
+                    selected_nodes=range(current_data.x.size(0)),
+                    edge_index=current_data.edge_index,
+                    edge_probs=current_probs
+                )
+
+                if best_e is None:
+                    break
+
+                orig_u, orig_v = current_data.orig_id[[best_src, best_dst]].tolist()
+                pair_dict[orig_u] = orig_v
+
+                remaining_orig_ids = remaining_orig_ids[
+                    (remaining_orig_ids != orig_u) & (remaining_orig_ids != orig_v)
+                    ]
+
+                if acc_graph.has_node(orig_u):
+                    acc_graph.remove_node(orig_u)
+                if acc_graph.has_node(orig_v):
+                    acc_graph.remove_node(orig_v)
+
+            if remaining_orig_ids.numel() == 2:
+                u, v = remaining_orig_ids.tolist()
+                pair_dict[u] = v
+
+
+            if gale_shapley.is_stable_matching(pair_dict, propr_pref,  prope_pref):
+                good += 1
             else:
-                logits = model(current_data)
-                current_probs = torch.sigmoid(logits)
-            best_e, (best_src, best_dst) = best_pairing_for_selected_node(
-                selected_nodes=range(current_data.x.size(0)),
-                edge_index=current_data.edge_index,
-                edge_probs=current_probs
-            )
+                bad += 1
 
-            if best_e is None:
-                break
-
-            orig_u, orig_v = current_data.orig_id[[best_src, best_dst]].tolist()
-            pair_dict[orig_u] = orig_v
-
-            remaining_orig_ids = remaining_orig_ids[
-                (remaining_orig_ids != orig_u) & (remaining_orig_ids != orig_v)
-                ]
-
-            if acc_graph.has_node(orig_u):
-                acc_graph.remove_node(orig_u)
-            if acc_graph.has_node(orig_v):
-                acc_graph.remove_node(orig_v)
-
-        if remaining_orig_ids.numel() == 2:
-            u, v = remaining_orig_ids.tolist()
-            pair_dict[u] = v
+    print("GRAPH LEVEL ACCURACY")
+    print(good/(good+bad))
 
 
-        if is_stable_matching(pair_dict, propr_pref,  prope_pref):
-            good += 1
-        else:
-            bad += 1
-
-print("GRAPH LEVEL ACCURACY")
-print(good/(good+bad))
+if __name__ == "__main__":
+    training = False
+    main(training)

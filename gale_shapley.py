@@ -1,6 +1,41 @@
-import networkx as nx
 from collections import deque
 
+
+def is_stable_matching(match_a, prefs_a, prefs_b):
+
+    match_b = {b: a for a, b in match_a.items() if b is not None}
+
+    rank_a = {
+        a: {b: i for i, b in enumerate(pref_list)}
+        for a, pref_list in prefs_a.items()
+    }
+    rank_b = {
+        b: {a: i for i, a in enumerate(pref_list)}
+        for b, pref_list in prefs_b.items()
+    }
+
+    blocking_pairs = []
+
+    for a in prefs_a:
+        current_b = match_a.get(a, None)
+
+        for b in prefs_a[a]:
+            if current_b == b:
+                continue
+
+            current_a_for_b = match_b.get(b, None)
+
+            a_prefers_b = (
+                current_b is None or rank_a[a][b] < rank_a[a][current_b]
+            )
+            b_prefers_a = (
+                current_a_for_b is None or rank_b[b][a] < rank_b[b][current_a_for_b]
+            )
+
+            if a_prefers_b and b_prefers_a:
+                blocking_pairs.append((a, b))
+
+    return len(blocking_pairs) == 0
 
 def stable_matching_with_preferences(G, left_nodes, right_nodes, prefs_left, prefs_right):
 

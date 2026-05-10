@@ -6,7 +6,7 @@ import gale_shapley
 from itertools import chain
 import statistics
 
-def generate_graph(group_nodes=10):
+def generate_graph_m(group_nodes=10):
     G = nx.Graph()
 
     G.add_nodes_from(list(range(group_nodes)), bipartite=0)
@@ -17,6 +17,16 @@ def generate_graph(group_nodes=10):
             G.add_edge(i,group_nodes+j)
     return G
 
+def generate_graph_r(group_nodes=10):
+    G = nx.Graph()
+
+    G.add_nodes_from(list(range(group_nodes*2)))
+
+    for i in range(group_nodes*2):
+        for j in range(group_nodes*2):
+            if i!=j:
+                G.add_edge(i,j)
+    return G
 
 def is_stable_matching(match_a, prefs_a, prefs_b):
 
@@ -54,209 +64,23 @@ def is_stable_matching(match_a, prefs_a, prefs_b):
 
     return len(blocking_pairs) == 0, blocking_pairs
 
-def graph_to_pyg_data_with_prefs(data_x,edge_index,edge_weight,edge_attr,proposee_pref,proposer_pref):
-    data = Data(
-        x=data_x,
-        edge_index=edge_index,
-        edge_attr=edge_weight,
-        edge_y=edge_attr,
-        proposee_pref=proposee_pref,
-        proposer_pref=proposer_pref
-    )
-    return data
-
-
-
-def graph_to_pyg_data_random(G, group_size,verbose=False):
-
-    nodes = list(G.nodes())
-    node_id_map = {n: i for i, n in enumerate(nodes)}
-
-
-
-    set1, set2 = nx.bipartite.sets(G)
-
-    x = []
-    proposer_pref = {}
-    proposee_pref = {}
-
-    edge_weight = []
-
-    for node in set1:
-        prefs_for_gale = list(range(group_size,group_size*2))
-        random.shuffle(prefs_for_gale)
-        prefs_for_model = [x - group_size for x in prefs_for_gale]
-        edge_weight += prefs_for_model
-        x.append(prefs_for_model)
-        proposer_pref[node] = prefs_for_gale
-
-    temp = []
-    for node in set2:
-        prefs_for_gale = list(range(group_size))
-        random.shuffle(prefs_for_gale)
-        prefs_for_model = prefs_for_gale
-        temp += prefs_for_model
-
-        edge_weight= list(chain(*zip(temp, edge_weight)))
-        x.append(prefs_for_model)
-        proposee_pref[node] = prefs_for_gale
-    e_w = []
-    for i in range(0,len(edge_weight),2):
-        e_w.append(edge_weight[i] + edge_weight[i+1])
-    edge_weight=e_w
-    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
-
-    who_am_i=0
-    where_am_i =0
-    x_final = []
-    for node in set1:
-        look = 1 * group_size
-        x_final.append([])
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        ranks = []
-        for node2 in set2:
-            if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=10
-            if x[look][-1] == who_am_i:
-                x_final[who_am_i][2] -=10
-            x_final[who_am_i][1]-=x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i)+1)
-            look+=1
-        ranks.sort()
-        x_final[who_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i+=1
-
-
+def calculate_embeddings(set1,set2,group_size,x_final,x):
     who_am_i = 0
-    where_am_i = group_size
-    for node in set2:
-        look = 0
-        x_final.append([])
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        ranks = []
-        for node2 in set1:
-            if x[look][0] == who_am_i:
-                x_final[where_am_i][0] += 10
-            if x[look][-1] == who_am_i:
-                x_final[where_am_i][2] -=10
-            x_final[where_am_i][1] -= x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i)+1)
-            look += 1
-        ranks.sort()
-        x_final[where_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i += 1
-
-
-
-    edges = []
-    for u, v in G.edges():
-        ui, vi = node_id_map[u], node_id_map[v]
-        edges.append([ui, vi])
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-
-
-
-
-    matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
-    if(verbose):
-        for line in x:
-            print(line)
-        print("Optimal matching")
-        print(is_stable_matching(matching, proposer_pref, proposee_pref))
-        print(matching)
-    e_attr= []
-
-    for u,v in G.edges():
-        if u in matching and matching[u] == v:
-            e_attr.append(1)
-        else:
-            e_attr.append(0)
-    edge_attr = torch.tensor(e_attr, dtype=torch.float)
-    data_x = torch.tensor(x_final, dtype=torch.float)
-    data = Data(
-        x=data_x,
-        edge_index=edge_index,
-        edge_attr=edge_weight,
-        edge_y=edge_attr,
-        proposee_pref = proposee_pref,
-        proposer_pref = proposer_pref
-    )
-    return data
-
-def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
-
-    nodes = list(G.nodes())
-    node_id_map = {n: i for i, n in enumerate(nodes)}
-
-
-
-    set1, set2 = nx.bipartite.sets(G)
-
-    x = []
-    proposer_pref = {}
-    proposee_pref = {}
-
-    edge_weight = []
-
-    dominant = 0
-    noDominant = True
-    for node in set1:
-        prefs_for_gale = list(range(group_size,group_size*2))
-        random.shuffle(prefs_for_gale)
-        if noDominant:
-            dominant = prefs_for_gale[0]
-            noDominant = False
-        else:
-            prefs_for_gale.remove(dominant)
-            prefs_for_gale.insert(0,dominant)
-
-        prefs_for_model = [x - group_size for x in prefs_for_gale]
-        edge_weight += prefs_for_model
-        x.append(prefs_for_model)
-        proposer_pref[node] = prefs_for_gale
-
-    temp = []
-    for node in set2:
-        prefs_for_gale = list(range(group_size))
-        random.shuffle(prefs_for_gale)
-        prefs_for_model = prefs_for_gale
-        temp += prefs_for_model
-
-        edge_weight= list(chain(*zip(temp, edge_weight)))
-        x.append(prefs_for_model)
-        proposee_pref[node] = prefs_for_gale
-    e_w = []
-    for i in range(0,len(edge_weight),2):
-        e_w.append(edge_weight[i] + edge_weight[i+1])
-    edge_weight=e_w
-    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
-
-    who_am_i=0
-    where_am_i =0
-    x_final = []
+    where_am_i = 0
     for node in set1:
         look = group_size
         x_final.append([])
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
+        for i in range(4):
+            x_final[who_am_i].append(0)
+
         ranks = []
         for node2 in set2:
             if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=10
+                x_final[who_am_i][0]  +=1
             if x[look][-1] == who_am_i:
-                x_final[who_am_i][2] -=10
+                x_final[who_am_i][2] -=1
             x_final[who_am_i][1]-=x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
+            ranks.append(x[look].index(who_am_i)+1)
             look+=1
         ranks.sort()
         x_final[who_am_i][3]=statistics.median(ranks)
@@ -269,24 +93,66 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
     for node in set2:
         look = 0
         x_final.append([])
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
+        for i in range(4):
+            x_final[where_am_i].append(0)
         ranks = []
         for node2 in set1:
             if x[look][0] == who_am_i:
-                x_final[where_am_i][0] += 10
+                x_final[where_am_i][0] += 1
             if x[look][-1] == who_am_i:
-                x_final[where_am_i][2] -= 10
+                x_final[where_am_i][2] -=1
             x_final[where_am_i][1] -= x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
+            ranks.append(x[look].index(who_am_i)+1)
             look += 1
         ranks.sort()
-        x_final[who_am_i][3]=statistics.median(ranks)
+        x_final[where_am_i][3]=statistics.median(ranks)
         where_am_i+=1
         who_am_i += 1
 
+
+def graph_to_pyg_data_random(G, group_size):
+
+    nodes = list(G.nodes())
+    node_id_map = {n: i for i, n in enumerate(nodes)}
+
+
+
+    set1, set2 = nx.bipartite.sets(G)
+
+    x = []
+    proposer_pref = {}
+    proposee_pref = {}
+
+    edge_weight = []
+
+    for node in set1:
+        prefs_for_gale = list(range(group_size,group_size*2))
+        random.shuffle(prefs_for_gale)
+        prefs_for_model = [x - group_size for x in prefs_for_gale]
+        edge_weight += prefs_for_model
+        x.append(prefs_for_model)
+        proposer_pref[node] = prefs_for_gale
+
+    temp = []
+    for node in set2:
+        prefs_for_gale = list(range(group_size))
+        random.shuffle(prefs_for_gale)
+        prefs_for_model = prefs_for_gale
+        temp += prefs_for_model
+
+        edge_weight= list(chain(*zip(temp, edge_weight)))
+        x.append(prefs_for_model)
+        proposee_pref[node] = prefs_for_gale
+    e_w = []
+    for i in range(0,len(edge_weight),2):
+        e_w.append(edge_weight[i] + edge_weight[i+1])
+    edge_weight=e_w
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
+
+
+    x_final = []
+
+    calculate_embeddings(set1,set2,group_size,x_final,x)
 
 
     edges = []
@@ -295,15 +161,89 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
         edges.append([ui, vi])
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
+    matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
 
+    e_attr= []
+
+    for u,v in G.edges():
+        if u in matching and matching[u] == v:
+            e_attr.append(1)
+        else:
+            e_attr.append(0)
+
+    edge_attr = torch.tensor(e_attr, dtype=torch.float)
+    data_x = torch.tensor(x_final, dtype=torch.float)
+    data = Data(
+        x=data_x,
+        edge_index=edge_index,
+        edge_attr=edge_weight,
+        edge_y=edge_attr,
+        proposee_pref = proposee_pref,
+        proposer_pref = proposer_pref
+    )
+    return data
+
+def graph_to_pyg_data_dominant_proposee(G, group_size):
+
+    nodes = list(G.nodes())
+    node_id_map = {n: i for i, n in enumerate(nodes)}
+
+
+
+    set1, set2 = nx.bipartite.sets(G)
+
+    x = []
+    proposer_pref = {}
+    proposee_pref = {}
+
+    edge_weight = []
+
+    dominant = 0
+    noDominant = True
+    for node in set1:
+        prefs_for_gale = list(range(group_size,group_size*2))
+        random.shuffle(prefs_for_gale)
+        if noDominant:
+            dominant = prefs_for_gale[0]
+            noDominant = False
+        else:
+            prefs_for_gale.remove(dominant)
+            prefs_for_gale.insert(0,dominant)
+
+        prefs_for_model = [x - group_size for x in prefs_for_gale]
+        edge_weight += prefs_for_model
+        x.append(prefs_for_model)
+        proposer_pref[node] = prefs_for_gale
+
+    temp = []
+    for node in set2:
+        prefs_for_gale = list(range(group_size))
+        random.shuffle(prefs_for_gale)
+        prefs_for_model = prefs_for_gale
+        temp += prefs_for_model
+
+        edge_weight= list(chain(*zip(temp, edge_weight)))
+        x.append(prefs_for_model)
+        proposee_pref[node] = prefs_for_gale
+    e_w = []
+    for i in range(0,len(edge_weight),2):
+        e_w.append(edge_weight[i] + edge_weight[i+1])
+    edge_weight=e_w
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
+
+
+    x_final = []
+    calculate_embeddings(set1,set2,group_size,x_final,x)
+
+    edges = []
+    for u, v in G.edges():
+        ui, vi = node_id_map[u], node_id_map[v]
+        edges.append([ui, vi])
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
 
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
-    if(verbose):
-        for line in x:
-            print(line)
-        print("Data")
-        print(x_final)
+
     e_attr= []
 
     for u,v in G.edges():
@@ -323,7 +263,7 @@ def graph_to_pyg_data_dominant_proposee(G, group_size,verbose=False):
     )
     return data
 
-def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
+def graph_to_pyg_data_dominant_proposer(G, group_size):
 
     nodes = list(G.nodes())
     node_id_map = {n: i for i, n in enumerate(nodes)}
@@ -373,56 +313,10 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
     edge_weight=e_w
     edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
-    look=group_size
-    who_am_i=0
-    where_am_i =0
+
     x_final = []
-    for node in set1:
-        look = 1 * group_size
-        x_final.append([])
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        ranks = []
-        for node2 in set2:
-            if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=10
-            if x[look][-1] == who_am_i:
-                x_final[who_am_i][2] -=10
-            x_final[who_am_i][1]-=x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
-            look+=1
-        ranks.sort()
-        x_final[who_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i+=1
 
-
-    look = 0
-    who_am_i = 0
-    where_am_i = group_size
-    for node in set2:
-        look = 0
-        x_final.append([])
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        ranks = []
-        for node2 in set1:
-            if x[look][0] == who_am_i:
-                x_final[where_am_i][0] += 10
-            if x[look][-1] == who_am_i:
-                x_final[where_am_i][2] -=10
-            x_final[where_am_i][1] -= x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
-            look += 1
-        ranks.sort()
-        x_final[where_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i += 1
-
+    calculate_embeddings(set1, set2, group_size, x_final, x)
 
 
     edges = []
@@ -435,11 +329,6 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
 
 
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
-    if(verbose):
-        for line in x:
-            print(line)
-        print("Data")
-        print(x_final)
     e_attr= []
 
     for u,v in G.edges():
@@ -460,7 +349,7 @@ def graph_to_pyg_data_dominant_proposer(G, group_size,verbose=False):
     return data
 
 
-def graph_to_pyg_data_low_diff(G, group_size,verbose=False):
+def graph_to_pyg_data_low_diff(G, group_size):
 
     nodes = list(G.nodes())
     node_id_map = {n: i for i, n in enumerate(nodes)}
@@ -508,56 +397,11 @@ def graph_to_pyg_data_low_diff(G, group_size,verbose=False):
     edge_weight=e_w
     edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
-    who_am_i=0
-    where_am_i =0
+
     x_final = []
-    for node in set1:
-        look =group_size
-        x_final.append([])
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        ranks = []
-        for node2 in set2:
-            if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=10
-            if x[look][-1] == who_am_i:
-                x_final[who_am_i][2] -=10
-            x_final[who_am_i][1]-=x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
-            look+=1
-        ranks.sort()
-        x_final[who_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i+=1
 
+    calculate_embeddings(set1, set2, group_size, x_final, x)
 
-    who_am_i = 0
-    where_am_i = group_size
-    for node in set2:
-        look = 0
-        x_final.append([])
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        ranks = []
-        for node2 in set1:
-            if x[look][0] == who_am_i:
-                x_final[where_am_i][0] += 10
-            if x[look][-1] == who_am_i:
-                x_final[where_am_i][2] -=10
-            x_final[where_am_i][1] -= x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
-            look += 1
-        ranks.sort()
-        x_final[where_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i += 1
-
-
-    edge_counter = 0
     edges = []
     for u, v in G.edges():
         ui, vi = node_id_map[u], node_id_map[v]
@@ -565,15 +409,8 @@ def graph_to_pyg_data_low_diff(G, group_size,verbose=False):
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
 
-
-
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
-    if(verbose):
-        for line in x:
-            print(line)
-        print("Optimal matching")
-        print(is_stable_matching(matching, proposer_pref, proposee_pref))
-        print(matching)
+
     e_attr= []
 
     for u,v in G.edges():
@@ -593,7 +430,7 @@ def graph_to_pyg_data_low_diff(G, group_size,verbose=False):
     )
     return data
 
-def graph_to_pyg_data_high_diff(G, group_size,verbose=False):
+def graph_to_pyg_data_high_diff(G, group_size):
 
     nodes = list(G.nodes())
     node_id_map = {n: i for i, n in enumerate(nodes)}
@@ -637,56 +474,10 @@ def graph_to_pyg_data_high_diff(G, group_size,verbose=False):
     edge_weight=e_w
     edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
-    look=group_size
-    who_am_i=0
-    where_am_i =0
+
     x_final = []
-    for node in set1:
-        look = 1 * group_size
-        x_final.append([])
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        x_final[who_am_i].append(0)
-        ranks = []
-        for node2 in set2:
-            if x[look][0] == who_am_i:
-                x_final[who_am_i][0]  +=10
-            if x[look][-1] == who_am_i:
-                x_final[who_am_i][2] -=10
-            x_final[who_am_i][1]-=x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
-            look+=1
-        ranks.sort()
-        x_final[who_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i+=1
 
-
-    look = 0
-    who_am_i = 0
-    where_am_i = group_size
-    for node in set2:
-        look = 0
-        x_final.append([])
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        x_final[where_am_i].append(0)
-        ranks = []
-        for node2 in set1:
-            if x[look][0] == who_am_i:
-                x_final[where_am_i][0] += 10
-            if x[look][-1] == who_am_i:
-                x_final[where_am_i][2] -=10
-            x_final[where_am_i][1] -= x[look].index(who_am_i)+1
-            ranks.append(x[look].index(who_am_i) + 1)
-            look += 1
-        ranks.sort()
-        x_final[where_am_i][3]=statistics.median(ranks)
-        where_am_i+=1
-        who_am_i += 1
-
+    calculate_embeddings(set1, set2, group_size, x_final, x)
 
 
     edges = []
@@ -699,12 +490,6 @@ def graph_to_pyg_data_high_diff(G, group_size,verbose=False):
 
 
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
-    if(verbose):
-        for line in x:
-            print(line)
-        print("Optimal matching")
-        print(is_stable_matching(matching, proposer_pref, proposee_pref))
-        print(matching)
     e_attr= []
 
     for u,v in G.edges():
@@ -712,6 +497,7 @@ def graph_to_pyg_data_high_diff(G, group_size,verbose=False):
             e_attr.append(1)
         else:
             e_attr.append(0)
+
     edge_attr = torch.tensor(e_attr, dtype=torch.float)
     data_x = torch.tensor(x_final, dtype=torch.float)
     data = Data(

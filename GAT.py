@@ -4,7 +4,7 @@ from torch_geometric.nn import GATv2Conv
 
 
 class GATEdgeClassifier(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, dropout=0.7):
+    def __init__(self, in_channels, hidden_channels, dropout=0.1):
         super().__init__()
 
         self.conv1 = GATv2Conv(
@@ -49,12 +49,12 @@ class GATEdgeClassifier(torch.nn.Module):
         x0 = x
         x = self.conv1(x, edge_index, edge_attr)
         x = x + self.skip1(x0)
-        x = F.elu(x)
+        x = F.relu(x)
 
         x1 = x
         x = self.conv2(x, edge_index, edge_attr)
         x = x + self.skip2(x1)
-        x = F.elu(x)
+        x = F.relu(x)
 
         src, dst = edge_index
 
