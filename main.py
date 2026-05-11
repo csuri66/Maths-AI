@@ -397,7 +397,7 @@ def main(training=False):
     good=0
     bad=0
     with torch.no_grad():
-        for i in range(1000):
+        for i in range(10):
 
             pair_dict = {}
 
@@ -478,6 +478,13 @@ def main(training=False):
     print("GRAPH LEVEL ACCURACY")
     print(good/(good+bad))
 
+    graph_r = data_generator.generate_graph_r(2)
+    data_r = data_generator.graph_to_pyg_data_r_random(graph_r,2)
+    data_r.x = (data_r.x - mean) / std
+    data_r.edge_attr = (data_r.edge_attr - mean_edge) / std_edge
+    logits = model(data_r)
+    probs = torch.sigmoid(logits)
+    print(logits)
 
 if __name__ == "__main__":
     training = False

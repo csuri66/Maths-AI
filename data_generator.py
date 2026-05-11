@@ -509,3 +509,56 @@ def graph_to_pyg_data_high_diff(G, group_size):
         proposer_pref = proposer_pref
     )
     return data
+
+
+def graph_to_pyg_data_r_random(G, group_size):
+    nodes = list(G.nodes())
+    node_id_map = {n: i for i, n in enumerate(nodes)}
+
+    prefs = {}
+    for node in nodes:
+        temp = nodes.copy()
+        temp.remove(node)
+        random.shuffle(temp)
+        pref = temp
+        prefs[node] = pref
+
+    edge_attr = []
+    edges = []
+    for u, v in G.edges():
+        ui, vi = node_id_map[u], node_id_map[v]
+        edge_attr.append(prefs[u].index(v)+1 + prefs[v].index(u)+1)
+        edges.append([ui, vi])
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+
+    who_am_i = 0
+    data_x = []
+    for node in nodes:
+        data_x.append([])
+        for i in range(4):
+            data_x[who_am_i].append(0)
+
+        ranks = []
+        for node_ in nodes:
+            if node_ == node:
+                continue
+            if prefs[node_][0] == node:
+                data_x[who_am_i][0]+=1
+            if prefs[node_][-1] == node:
+                data_x[who_am_i][2]-=1
+            data_x[who_am_i][1]+=prefs[node_].index(node)+1
+            ranks.append(prefs[node_].index(node))
+        ranks.sort()
+        data_x[who_am_i][3] = statistics.median(ranks)
+        who_am_i += 1
+    data_x = torch.tensor(data_x, dtype=torch.float)
+
+    data = Data(
+        x=data_x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        prefs = prefs
+    )
+    return data
