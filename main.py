@@ -326,7 +326,7 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,m
 
 
 
-def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False):
+def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,GAT_TEST=False,LOCAL_LLM = False):
 
     group_size=3
 
@@ -396,82 +396,83 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False)
 
     good=0
     bad=0
-    with torch.no_grad():
-        for i in range(1000):
+    if GAT_TEST:
+        with torch.no_grad():
+            for i in range(1000):
 
-            pair_dict = {}
+                pair_dict = {}
 
-            group_size=3
-            acc_graph = data_generator.generate_graph_m(group_size)
+                group_size=3
+                acc_graph = data_generator.generate_graph_m(group_size)
 
-            structure = random.randint(0,100)
-            num = structure %2
-            match num:
-                case 0:
-                    acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
-                case 1:
-                    acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
+                structure = random.randint(0,100)
+                num = structure %2
+                match num:
+                    case 0:
+                        acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
+                    case 1:
+                        acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
 
-            acc_data.x = (acc_data.x - mean) / std
-            acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
+                acc_data.x = (acc_data.x - mean) / std
+                acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
 
-            logits = model(acc_data)
-            probs = torch.sigmoid(logits)
-            propr_pref=acc_data.proposer_pref
-            prope_pref = acc_data.proposee_pref
-            original_data = acc_data
-            if not hasattr(original_data, "orig_id") or original_data.orig_id is None:
-                original_data.orig_id = torch.arange(
-                    original_data.x.size(0),
-                    device=original_data.x.device
-                )
+                logits = model(acc_data)
+                probs = torch.sigmoid(logits)
+                propr_pref=acc_data.proposer_pref
+                prope_pref = acc_data.proposee_pref
+                original_data = acc_data
+                if not hasattr(original_data, "orig_id") or original_data.orig_id is None:
+                    original_data.orig_id = torch.arange(
+                        original_data.x.size(0),
+                        device=original_data.x.device
+                    )
 
-            remaining_orig_ids = original_data.orig_id.clone()
+                remaining_orig_ids = original_data.orig_id.clone()
 
-            for i in range(group_size - 1):
+                for i in range(group_size - 1):
 
-                current_data = build_current_data_from_original(
-                    original_data,
-                    remaining_orig_ids
-                )
+                    current_data = build_current_data_from_original(
+                        original_data,
+                        remaining_orig_ids
+                    )
 
-                if i == 0:
-                    current_probs = probs
+                    if i == 0:
+                        current_probs = probs
+                    else:
+                        logits = model(current_data)
+                        current_probs = torch.sigmoid(logits)
+                    best_e, (best_src, best_dst) = best_pairing_for_selected_node(
+                        selected_nodes=range(current_data.x.size(0)),
+                        edge_index=current_data.edge_index,
+                        edge_probs=current_probs
+                    )
+
+                    if best_e is None:
+                        break
+
+                    orig_u, orig_v = current_data.orig_id[[best_src, best_dst]].tolist()
+                    pair_dict[orig_u] = orig_v
+
+                    remaining_orig_ids = remaining_orig_ids[
+                        (remaining_orig_ids != orig_u) & (remaining_orig_ids != orig_v)
+                        ]
+
+                    if acc_graph.has_node(orig_u):
+                        acc_graph.remove_node(orig_u)
+                    if acc_graph.has_node(orig_v):
+                        acc_graph.remove_node(orig_v)
+
+                if remaining_orig_ids.numel() == 2:
+                    u, v = remaining_orig_ids.tolist()
+                    pair_dict[u] = v
+
+                if gale_shapley.is_stable_matching(pair_dict, propr_pref,  prope_pref):
+                    good += 1
                 else:
-                    logits = model(current_data)
-                    current_probs = torch.sigmoid(logits)
-                best_e, (best_src, best_dst) = best_pairing_for_selected_node(
-                    selected_nodes=range(current_data.x.size(0)),
-                    edge_index=current_data.edge_index,
-                    edge_probs=current_probs
-                )
+                    bad += 1
 
-                if best_e is None:
-                    break
-
-                orig_u, orig_v = current_data.orig_id[[best_src, best_dst]].tolist()
-                pair_dict[orig_u] = orig_v
-
-                remaining_orig_ids = remaining_orig_ids[
-                    (remaining_orig_ids != orig_u) & (remaining_orig_ids != orig_v)
-                    ]
-
-                if acc_graph.has_node(orig_u):
-                    acc_graph.remove_node(orig_u)
-                if acc_graph.has_node(orig_v):
-                    acc_graph.remove_node(orig_v)
-
-            if remaining_orig_ids.numel() == 2:
-                u, v = remaining_orig_ids.tolist()
-                pair_dict[u] = v
-
-            if gale_shapley.is_stable_matching(pair_dict, propr_pref,  prope_pref):
-                good += 1
-            else:
-                bad += 1
-
-    print("GRAPH LEVEL ACCURACY GATv2 TEST")
-    print(good/(good+bad))
+        print("GRAPH LEVEL ACCURACY GATv2 TEST")
+        print(good/(good+bad))
 
 
     if roommate:
@@ -522,12 +523,35 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False)
         print(good/(good+bad))
 
 
+    if LOCAL_LLM:
+        import requests
 
+        prompts = []
+        with open("prompts_for_local_llm.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                prompts.append(line)
+
+        for i, prompt in enumerate(prompts, 1):
+            r = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "mistral",
+                    "prompt": prompt,
+                    "stream": False
+                }
+            )
+            data = r.json()
+            print(f"\n--- Prompt {i} ---")
+            print(prompt)
+            print("\n--- Válasz ---")
+            print(data["response"])
 
 
 if __name__ == "__main__":
     training = False
     roommate = False
     LLM_FILE_GEN = False
-    LLM_TEST = True
-    main(training, roommate,LLM_FILE_GEN,LLM_TEST)
+    LLM_TEST = False
+    GAT_TEST = False
+    LOCAL_LLM = True
+    main(training, roommate,LLM_FILE_GEN,LLM_TEST,GAT_TEST,LOCAL_LLM)
