@@ -7,34 +7,41 @@ class GATEdgeClassifier(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, dropout=0.1):
         super().__init__()
 
+        self.heads = 8
+        self.out_dim = hidden_channels * self.heads
+
         self.conv1 = GATv2Conv(
             in_channels,
             hidden_channels,
-            heads=8,
+            heads=self.heads,
             edge_dim=1,
-            concat=False,
+            concat=True,
             dropout=dropout
         )
-        self.skip1 = torch.nn.Linear(in_channels, hidden_channels)
+
+        self.skip1 = torch.nn.Linear(in_channels, self.out_dim)
 
         self.conv2 = GATv2Conv(
+            self.out_dim,
             hidden_channels,
-            hidden_channels,
-            heads=8,
+            heads=self.heads,
             edge_dim=1,
-            concat=False,
+            concat=True,
             dropout=dropout
         )
-        self.skip2 = torch.nn.Linear(hidden_channels, hidden_channels)
+
+        self.skip2 = torch.nn.Linear(self.out_dim, self.out_dim)
 
         self.edge_mlp = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels * 4 + 1, hidden_channels),
+            torch.nn.Linear(self.out_dim * 4 + 1, self.out_dim),
             torch.nn.Tanh(),
             torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
+
+            torch.nn.Linear(self.out_dim, hidden_channels),
             torch.nn.Tanh(),
             torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_channels // 2, 1)
+
+            torch.nn.Linear(hidden_channels, 1)
         )
 
     def forward(self, data):

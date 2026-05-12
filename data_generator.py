@@ -20,10 +20,10 @@ def generate_graph_m(group_nodes=10):
 def generate_graph_r(group_nodes=10):
     G = nx.Graph()
 
-    G.add_nodes_from(list(range(group_nodes*2)))
+    G.add_nodes_from(list(range(group_nodes)))
 
-    for i in range(group_nodes*2):
-        for j in range(group_nodes*2):
+    for i in range(group_nodes):
+        for j in range(group_nodes):
             if i!=j:
                 G.add_edge(i,j)
     return G

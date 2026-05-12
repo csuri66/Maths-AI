@@ -1,4 +1,4 @@
-
+import ast
 import torch
 from torch_geometric.data import Data
 import GAT
@@ -326,7 +326,7 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,m
 
 
 
-def main(training=False):
+def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False):
 
     group_size=3
 
@@ -397,24 +397,20 @@ def main(training=False):
     good=0
     bad=0
     with torch.no_grad():
-        for i in range(10):
+        for i in range(1000):
 
             pair_dict = {}
 
-            group_size=random.randint(2,5)
+            group_size=3
             acc_graph = data_generator.generate_graph_m(group_size)
 
-            structure = 0
-            num = structure %4
+            structure = random.randint(0,100)
+            num = structure %2
             match num:
                 case 0:
                     acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
                 case 1:
                     acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
-                case 2:
-                    acc_data = data_generator.graph_to_pyg_data_dominant_proposer(acc_graph, group_size)
-                case 3:
-                    acc_data = data_generator.graph_to_pyg_data_dominant_proposee(acc_graph, group_size)
 
             acc_data.x = (acc_data.x - mean) / std
             acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
@@ -469,23 +465,69 @@ def main(training=False):
                 u, v = remaining_orig_ids.tolist()
                 pair_dict[u] = v
 
-
             if gale_shapley.is_stable_matching(pair_dict, propr_pref,  prope_pref):
                 good += 1
             else:
                 bad += 1
 
-    print("GRAPH LEVEL ACCURACY")
+    print("GRAPH LEVEL ACCURACY GATv2 TEST")
     print(good/(good+bad))
 
-    graph_r = data_generator.generate_graph_r(2)
-    data_r = data_generator.graph_to_pyg_data_r_random(graph_r,2)
-    data_r.x = (data_r.x - mean) / std
-    data_r.edge_attr = (data_r.edge_attr - mean_edge) / std_edge
-    logits = model(data_r)
-    probs = torch.sigmoid(logits)
-    print(logits)
+
+    if roommate:
+        print("Stable roommate case")
+        g_size = 4
+        graph_r = data_generator.generate_graph_r(g_size)
+
+        data_r = data_generator.graph_to_pyg_data_r_random(graph_r,g_size)
+        print(data_r.prefs)
+        print(data_r.x)
+        print(data_r.edge_attr)
+        data_r.x = (data_r.x - mean) / std
+        data_r.edge_attr = (data_r.edge_attr - mean_edge) / std_edge
+        logits = model(data_r)
+        probs = torch.sigmoid(logits)
+        print(probs)
+
+    if LLM_FILE_GEN:
+        with open("LLM_PREF_DATA_M.txt", "w", encoding="utf-8") as f:
+            for i in range(100):
+                low_diff = data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph_m(3), 3)
+                f.write(str(low_diff.proposer_pref)+";")
+                f.write(str(low_diff.proposee_pref)+ "\n")
+                high_diff=  data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph_m(3), 3)
+                f.write(str(high_diff.proposer_pref)+";")
+                f.write(str(high_diff.proposee_pref)+ "\n")
+
+    good = 0
+    bad = 0
+    if LLM_TEST:
+        proposer_prefs = []
+        proposee_prefs = []
+        with open("LLM_PREF_DATA_M.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                prefs = line.strip().split(";")
+                proposer_prefs.append(ast.literal_eval(prefs[0]))
+                proposee_prefs.append(ast.literal_eval(prefs[1]))
+        index = 0
+        with open("stable_matchings_only.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                result = ast.literal_eval(line)
+                if gale_shapley.is_stable_matching(result, proposer_prefs[index], proposee_prefs[index]):
+                    good +=1
+                else:
+                    bad +=1
+                index += 1
+        print("GRAPH LEVEL ACCURACY LLM TEST")
+        print(good/(good+bad))
+
+
+
+
 
 if __name__ == "__main__":
     training = False
-    main(training)
+    roommate = False
+    LLM_FILE_GEN = False
+    LLM_TEST = True
+    main(training, roommate,LLM_FILE_GEN,LLM_TEST)
