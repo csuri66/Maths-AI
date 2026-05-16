@@ -174,13 +174,12 @@ def stable_matching_loss(
     n_right,
     lambda_match,
     lambda_stab,
-    tau,
-    pos_weight
+    tau
 ):
     probs = torch.sigmoid(logits)
 
     loss_edge = F.binary_cross_entropy_with_logits(
-            logits, edge_label,pos_weight=pos_weight
+            logits, edge_label
     )
 
 
@@ -203,13 +202,13 @@ def stable_matching_loss(
 
     loss_stab = (not_selected * better_for_left * better_for_right).mean()
 
-    loss = loss_edge + lambda_match * loss_match + lambda_stab * loss_stab
+    loss = loss_edge+ lambda_match * loss_match + lambda_stab * loss_stab
 
     return loss
 
 
 
-def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,model,optimizer,train_data,group_size,eval_every,val_data,patience,min_delta,pos_weight):
+def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,model,optimizer,train_data,group_size,eval_every,val_data,patience,min_delta):
     for epoch in range(500):
         model.train()
 
@@ -248,8 +247,7 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,m
                 n_right=group_size,
                 lambda_match=lambda_match,
                 lambda_stab=lambda_stab,
-                tau=tau,
-                pos_weight=pos_weight
+                tau=tau
             )
             loss.backward()
             optimizer.step()
@@ -296,8 +294,7 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,m
                             n_right=group_size,
                             lambda_match=lambda_match,
                             lambda_stab=lambda_stab,
-                            tau=tau,
-                            pos_weight=pos_weight
+                            tau=tau
                         )
                         val_loss_sum += val_loss
                         val_count += 1
@@ -358,8 +355,6 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     std_edge =  all_train_edge.std(dim=0, keepdim=True)
 
 
-
-
     for g in train_data:
         g.x = (g.x - mean) / std
         g.edge_attr=(g.edge_attr - mean_edge) / std_edge
@@ -368,13 +363,8 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
         g.x = (g.x - mean) / std
         g.edge_attr = (g.edge_attr - mean_edge) / std_edge
 
-
     model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
     optimizer = torch.optim.Adagrad(model.parameters(), lr=0.015)
-    pos = sum(data.edge_y.sum().item() for data in train_data)
-    total = sum(data.edge_y.numel() for data in train_data)
-    neg = total - pos
-    pos_weight = torch.tensor(neg/pos, dtype=torch.float)
 
 
     patience = 10
@@ -387,7 +377,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
 
 
     if training:
-        train(global_step, best_val_loss, stop_training, 0.25, 0.45, 0.1,model,optimizer,train_data, group_size, eval_every, val_data, patience, min_delta,pos_weight)
+        train(global_step, best_val_loss, stop_training, 0.2, 0.3, 0.5,model,optimizer,train_data, group_size, eval_every, val_data, patience, min_delta)
     model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 
 
@@ -552,6 +542,6 @@ if __name__ == "__main__":
     roommate = False
     LLM_FILE_GEN = False
     LLM_TEST = False
-    GAT_TEST = False
-    LOCAL_LLM = True
+    GAT_TEST = True
+    LOCAL_LLM = False
     main(training, roommate,LLM_FILE_GEN,LLM_TEST,GAT_TEST,LOCAL_LLM)
