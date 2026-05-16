@@ -1,1 +1,1 @@
-Stabil párosítási probléma megoldása GATv2 modellel. Munkaterv a Beadando terv.pdf-ben található.
+Stabil párosítási probléma megoldása GATv2 modellel. Dokumentáció a Documentation-ben található.
