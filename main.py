@@ -388,7 +388,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     bad=0
     if GAT_TEST:
         with torch.no_grad():
-            for i in range(1000):
+            for i in range(5000):
 
                 pair_dict = {}
 
@@ -399,9 +399,9 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 num = structure %2
                 match num:
                     case 0:
-                        acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
+                        acc_data = data_generator.graph_to_pyg_data_random(acc_graph, group_size)
                     case 1:
-                        acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
+                        acc_data = data_generator.graph_to_pyg_data_random(acc_graph, group_size)
 
                 acc_data.x = (acc_data.x - mean) / std
                 acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
@@ -462,7 +462,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                     bad += 1
 
         print("GRAPH LEVEL ACCURACY GATv2 TEST")
-        print(good/(good+bad))
+        print(f"Accuracy: {(good/(good+bad))*100} %")
 
 
     if roommate:
