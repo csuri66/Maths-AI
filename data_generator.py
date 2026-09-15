@@ -15,6 +15,7 @@ def generate_graph_m(group_nodes=10):
     for i in range(group_nodes):
         for j in range(group_nodes):
             G.add_edge(i,group_nodes+j)
+            G.add_edge(group_nodes + j,i)
     return G
 
 def generate_graph_r(group_nodes=10):
@@ -145,8 +146,8 @@ def graph_to_pyg_data_random(G, group_size):
         proposee_pref[node] = prefs_for_gale
     e_w = []
     for i in range(0,len(edge_weight),2):
-        e_w.append(edge_weight[i] + edge_weight[i+1])
-    edge_weight=e_w
+        e_w.append(1.0-(edge_weight[i] + edge_weight[i+1]/2))
+    edge_weight=list(chain(*zip(e_w, e_w)))
     edge_weight = torch.tensor(edge_weight, dtype=torch.float)
 
 
@@ -159,6 +160,7 @@ def graph_to_pyg_data_random(G, group_size):
     for u, v in G.edges():
         ui, vi = node_id_map[u], node_id_map[v]
         edges.append([ui, vi])
+        edges.append([vi, ui])
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
     matching = gale_shapley.stable_matching_with_preferences(G,set1,set2,proposer_pref,proposee_pref)
@@ -168,18 +170,76 @@ def graph_to_pyg_data_random(G, group_size):
     for u,v in G.edges():
         if u in matching and matching[u] == v:
             e_attr.append(1)
+            e_attr.append(1)
         else:
+            e_attr.append(0)
             e_attr.append(0)
 
     edge_attr = torch.tensor(e_attr, dtype=torch.float)
     data_x = torch.tensor(x_final, dtype=torch.float)
+
+    prefs_ = proposee_pref | proposer_pref
+
+    edge_id_of = {}
+    src_list = []
+    dst_list = []
+    for u, pref_list in prefs_.items():
+
+        for rank, v in enumerate(pref_list):
+            edge_id = len(src_list)
+
+            src_list.append(u)
+            dst_list.append(v)
+
+            edge_id_of[(u, v)] = edge_id
+
+    better_indices = []
+    worse_indices = []
+
+    for u, pref_list in prefs_.items():
+        edge_ids = [
+            edge_id_of[(u, v)]
+            for v in pref_list
+        ]
+
+        if len(edge_ids) < 2:
+            continue
+        pairs_per_agent = None
+        if pairs_per_agent is None:
+            # Csak szomszédos rangok:
+            # 1. preferencia > 2. preferencia,
+            # 2. preferencia > 3. preferencia, stb.
+            for i in range(len(edge_ids) - 1):
+                better_indices.append(edge_ids[i])
+                worse_indices.append(edge_ids[i + 1])
+        """
+        else:
+            # Véletlen rank-párok mintázása:
+            for _ in range(pairs_per_agent):
+                i = torch.randint(
+                    low=0,
+                    high=len(edge_ids) - 1,
+                    size=(1,),
+                ).item()
+
+                j = torch.randint(
+                    low=i + 1,
+                    high=len(edge_ids),
+                    size=(1,),
+                ).item()
+
+                better_indices.append(edge_ids[i])
+                worse_indices.append(edge_ids[j])
+        """
     data = Data(
         x=data_x,
         edge_index=edge_index,
         edge_attr=edge_weight,
         edge_y=edge_attr,
         proposee_pref = proposee_pref,
-        proposer_pref = proposer_pref
+        proposer_pref = proposer_pref,
+        rank_better_idx = better_indices,
+        rank_worse_idx = worse_indices
     )
     return data
 

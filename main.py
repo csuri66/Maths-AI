@@ -6,6 +6,7 @@ import data_generator
 import torch.nn.functional as F
 import gale_shapley
 import random
+import encoder
 
 def build_current_data_from_original(original_data, remaining_orig_ids):
     device = original_data.x.device
@@ -54,38 +55,97 @@ def build_current_data_from_original(original_data, remaining_orig_ids):
 
     return current_data
 
-def best_pairing_for_selected_node(selected_nodes, edge_index, edge_probs):
+def best_pairing_for_selected_node(
+    selected_nodes,
+    edge_index,
+    edge_probs,
+    preference_lists,
+    tolerance=0.01
+):
     selected_set = set(selected_nodes)
 
     ei = edge_index.detach().cpu()
     probs = edge_probs.detach().cpu().view(-1)
 
-    best_e = None
-    best_p = float("-inf")
-    best_src = None
-    best_dst = None
+    # preference_lists[node] = [partner1, partner2, ...]
+    pref_rank = {
+        node: {partner: i for i, partner in enumerate(prefs)}
+        for node, prefs in preference_lists.items()
+    }
 
+    def get_rank(node, partner):
+        return pref_rank.get(node, {}).get(partner, float("inf"))
+
+    valid_edges = []
     E = ei.size(1)
-    for e in range(E):
-        src = int(ei[0, e].item())
-        dst = int(ei[1, e].item())
 
-        if src not in selected_set or dst not in selected_set:
+    for e in range(E):
+        a = int(ei[0, e].item())
+        b = int(ei[1, e].item())
+
+        if a not in selected_set or b not in selected_set:
             continue
-        if src == dst:
+        if a == b:
             continue
 
         p = float(probs[e].item())
-        if p > best_p:
-            best_p = p
-            best_e = e
-            best_src = src
-            best_dst = dst
+        valid_edges.append((e, a, b, p))
 
-    if best_e is None:
+    if not valid_edges:
         return None, None, None
 
-    return best_e, (best_src, best_dst)
+    # 1) Legnagyobb valószínűségű él
+    base_e, u, v, base_p = max(valid_edges, key=lambda x: x[3])
+
+    # Az eredeti él rangja a két végpont preferencialistájában
+    base_rank_u = get_rank(u, v)
+    base_rank_v = get_rank(v, u)
+
+    # Alapból marad a base edge
+    chosen_e, chosen_a, chosen_b, chosen_p = base_e, u, v, base_p
+    chosen_pref_rank = float("inf")
+
+    # 2) Nézzük a közeli, egyik végpontot megosztó éleket
+    for e, a, b, p in valid_edges:
+        if e == base_e:
+            continue
+
+        # csak a base edge-hez közeli valószínűségek érdekelnek
+        if abs(p - base_p) > tolerance:
+            continue
+
+        better = False
+        cand_pref_rank = float("inf")
+
+        # Megosztja u-t a base edge-dzsel?
+        if a == u or b == u:
+            other = b if a == u else a
+            if other != v:
+                r = get_rank(u, other)
+                if r < base_rank_u:
+                    better = True
+                    cand_pref_rank = min(cand_pref_rank, r)
+
+        # Megosztja v-t a base edge-dzsel?
+        if a == v or b == v:
+            other = b if a == v else a
+            if other != u:
+                r = get_rank(v, other)
+                if r < base_rank_v:
+                    better = True
+                    cand_pref_rank = min(cand_pref_rank, r)
+
+        # Ha preferencia szerint jobb, akkor jelölt lehet
+        if better:
+            if (
+                cand_pref_rank < chosen_pref_rank or
+                (cand_pref_rank == chosen_pref_rank and p > chosen_p)
+            ):
+                chosen_e, chosen_a, chosen_b, chosen_p = e, a, b, p
+                chosen_pref_rank = cand_pref_rank
+
+    return chosen_e, (chosen_a, chosen_b)
+
 
 def filter_node_field(field, keep_node_mask, old_to_new=None):
     if field is None:
@@ -322,25 +382,82 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,m
     return best_val_loss
 
 
+def encoder_loss(
+    out,
+    batch,
+    pos_weight_membership: float = 10.0,
+):
+    """
+    out:
+      out.node_embedding           [N, D]
+      out.edge_embedding           [E, D]
+      out.auxiliary["mutual_quality"] [E]
+      out.auxiliary["utility"]        [E]
+
+    batch:
+      batch.rank_better_idx       [P]
+      batch.rank_worse_idx        [P]
+      batch.mutual_target         [E]
+      batch.member_a_target       [E]
+      batch.member_b_target       [E]
+    """
+
+    z = out.edge_embedding
+
+    # Egy irányított edge-rank score headet célszerű
+    # magában az encoder modellben regisztrálni.
+    rank_score = out.auxiliary["rank_score"]
+    better = rank_score[batch.rank_better_idx]
+    worse = rank_score[batch.rank_worse_idx]
+
+    rank_loss = -F.logsigmoid(
+        better - worse
+    ).mean()
+
+    mutual_pred = out.auxiliary["mutual_quality"]
+    mutual_loss = F.smooth_l1_loss(
+        mutual_pred,
+        batch.edge_attr,
+    )
+
+    pos_weight = torch.tensor(
+        pos_weight_membership,
+        device=z.device,
+    )
+    member_loss = F.binary_cross_entropy_with_logits(
+            out.auxiliary["stable_membership_logit"],
+            batch.edge_y,
+            pos_weight=pos_weight,
+    )
+
+
+    total = (
+        1.0 * rank_loss
+        + 0.5 * mutual_loss
+        + 1.0 * member_loss
+    )
+
+    metrics = {
+        "loss": total.detach(),
+        "rank_loss": rank_loss.detach(),
+        "mutual_loss": mutual_loss.detach(),
+        "member_loss": member_loss.detach(),
+    }
+    return total, metrics
+
 
 def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,GAT_TEST=False,LOCAL_LLM = False):
 
     group_size=3
 
     train_data = []
-    for j in range(200):
+    for j in range(100):
         train_data.append(
-            data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph_m(group_size), group_size))
-        train_data.append(
-            data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph_m(group_size), group_size))
-
-
+            data_generator.graph_to_pyg_data_random(data_generator.generate_graph_m(group_size), group_size))
     val_data = []
     for i in range(100):
         val_data.append(
-            data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph_m(group_size), group_size))
-        val_data.append(
-            data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph_m(group_size), group_size))
+            data_generator.graph_to_pyg_data_random(data_generator.generate_graph_m(group_size), group_size))
 
 
 
@@ -363,6 +480,45 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
         g.x = (g.x - mean) / std
         g.edge_attr = (g.edge_attr - mean_edge) / std_edge
 
+    enc = encoder.StableMatchingEdgeEncoder(
+        node_feature_dim=train_data[0].x.shape[1],
+        edge_feature_dim=1,
+        hidden_dim=128,
+        num_layers=4,
+    )
+
+    optimizer = torch.optim.AdamW(
+        enc.parameters(),
+        lr=3e-4,
+        weight_decay=1e-4,
+    )
+    for epoch in range(100):
+        enc.train()
+        print("Epoch: " + str(epoch))
+        for batch in train_data:
+            out = enc(
+                x=batch.x,
+                edge_index=batch.edge_index,
+                edge_attr=batch.edge_attr.float().unsqueeze(-1),
+            )
+
+            loss, metrics = encoder_loss(
+                out=out,
+                batch=batch,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                enc.parameters(),
+                max_norm=1.0,
+            )
+
+            optimizer.step()
+    torch.save(enc.state_dict(), "enc.pt")
+
+
+    """
     model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
     optimizer = torch.optim.Adagrad(model.parameters(), lr=0.015)
 
@@ -383,13 +539,13 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
 
 
     model.eval()
+    
 
     good=0
     bad=0
     if GAT_TEST:
         with torch.no_grad():
-            for i in range(5000):
-
+            for i in range(2500):
                 pair_dict = {}
 
                 group_size=3
@@ -399,9 +555,9 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 num = structure %2
                 match num:
                     case 0:
-                        acc_data = data_generator.graph_to_pyg_data_random(acc_graph, group_size)
+                        acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
                     case 1:
-                        acc_data = data_generator.graph_to_pyg_data_random(acc_graph, group_size)
+                        acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
 
                 acc_data.x = (acc_data.x - mean) / std
                 acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
@@ -410,6 +566,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 probs = torch.sigmoid(logits)
                 propr_pref=acc_data.proposer_pref
                 prope_pref = acc_data.proposee_pref
+                ag = propr_pref |prope_pref
                 original_data = acc_data
                 if not hasattr(original_data, "orig_id") or original_data.orig_id is None:
                     original_data.orig_id = torch.arange(
@@ -434,9 +591,10 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                     best_e, (best_src, best_dst) = best_pairing_for_selected_node(
                         selected_nodes=range(current_data.x.size(0)),
                         edge_index=current_data.edge_index,
-                        edge_probs=current_probs
+                        edge_probs=current_probs,
+                        preference_lists=ag,
+                        tolerance=0.01
                     )
-
                     if best_e is None:
                         break
 
@@ -535,13 +693,13 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
             print(prompt)
             print("\n--- Válasz ---")
             print(data["response"])
-
+    """
 
 if __name__ == "__main__":
     training = False
     roommate = False
     LLM_FILE_GEN = False
     LLM_TEST = False
-    GAT_TEST = True
+    GAT_TEST = False
     LOCAL_LLM = False
     main(training, roommate,LLM_FILE_GEN,LLM_TEST,GAT_TEST,LOCAL_LLM)
