@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import gale_shapley
 import random
 import encoder
+import decoder
 
 def build_current_data_from_original(original_data, remaining_orig_ids):
     device = original_data.x.device
@@ -445,13 +446,275 @@ def encoder_loss(
     }
     return total, metrics
 
+from typing import Dict
+
+@torch.no_grad()
+def greedy_decode_pairs(
+    edge_index: torch.Tensor,
+    directed_logits: torch.Tensor,
+    num_nodes: int,
+    debug: bool = False,
+) -> torch.Tensor:
+    """
+    Greedy one-to-one decoder irányított preferenciaélekhez.
+
+    Input
+    -----
+    edge_index:
+        [2, E], ahol edge_index[:, e] = [u, v] az u -> v él.
+
+    directed_logits:
+        [E], a decoder által adott nyers logitok.
+
+    num_nodes:
+        Node-ok száma.
+
+    Output
+    ------
+    partner:
+        [N], ahol partner[u] = v vagy -1.
+
+    Megjegyzés:
+    - Csak matching-feasibilityt garantál.
+    - Stabilitást nem garantál általánosan.
+    """
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError(
+            "edge_index shape-ja [2, E] legyen, "
+            f"de ezt kaptam: {tuple(edge_index.shape)}"
+        )
+
+    if directed_logits.ndim != 1:
+        raise ValueError(
+            "directed_logits shape-ja [E] legyen, "
+            f"de ezt kaptam: {tuple(directed_logits.shape)}"
+        )
+
+    if edge_index.size(1) != directed_logits.numel():
+        raise ValueError(
+            "Eltér az edge_index és directed_logits élszáma: "
+            f"{edge_index.size(1)} vs {directed_logits.numel()}"
+        )
+
+    device = edge_index.device
+
+    # GPU -> CPU: a Python dictionary és rendezés céljára.
+    src = edge_index[0].detach().cpu().tolist()
+    dst = edge_index[1].detach().cpu().tolist()
+    logits = directed_logits.detach().cpu().tolist()
+
+    # Minden u -> v él logitja.
+    directed_score: Dict[Tuple[int, int], float] = {}
+
+    for u, v, score in zip(src, dst, logits):
+        if u == v:
+            continue
+
+        # Ha duplikált edge van, a nagyobb score-t tartjuk meg.
+        if (u, v) not in directed_score:
+            directed_score[(u, v)] = float(score)
+        else:
+            directed_score[(u, v)] = max(
+                directed_score[(u, v)],
+                float(score),
+            )
+
+    # Irányítatlan, kölcsönösen elfogadható pairök.
+    candidate_pairs: List[Tuple[float, int, int]] = []
+
+    for (u, v), score_uv in directed_score.items():
+        # Csak canonical irányból készítjük el a párt:
+        # így {u,v} egyszer kerül a listába.
+        if u >= v:
+            continue
+
+        score_vu = directed_score.get((v, u))
+
+        # Csak kölcsönös preferenciaélből lehet matching-pár.
+        if score_vu is None:
+            continue
+
+        pair_score = 0.5 * (score_uv + score_vu)
+        candidate_pairs.append((pair_score, u, v))
+
+    # Nagyobb score előre.
+    candidate_pairs.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    partner = torch.full(
+        (num_nodes,),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+
+    if debug:
+        print("\n--- Candidate pairök score szerint ---")
+        for score, u, v in candidate_pairs:
+            print(
+                f"({u}, {v}) | "
+                f"score={score:+.6f}"
+            )
+
+    for score, u, v in candidate_pairs:
+        if (
+            partner[u].item() == -1
+            and partner[v].item() == -1
+        ):
+            partner[u] = v
+            partner[v] = u
+
+            if debug:
+                print(
+                    f"SELECT ({u}, {v}) "
+                    f"score={score:+.6f}"
+                )
+        elif debug:
+            print(
+                f"SKIP   ({u}, {v}) "
+                f"score={score:+.6f}, "
+                f"partner[{u}]={partner[u].item()}, "
+                f"partner[{v}]={partner[v].item()}"
+            )
+
+    return partner
+
+
+
+from typing import List, Tuple
+import torch
+
+
+def find_blocking_pairs(
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    partner: torch.Tensor,
+) -> List[Tuple[int, int]]:
+    """
+    Csak blocking paireket keres strict, one-to-one matchinghez.
+
+    Parameters
+    ----------
+    edge_index:
+        [2, E] irányított preferenciaélek.
+        edge_index[:, e] = [u, v] azt jelenti:
+        u elfogadja v-t.
+
+    edge_attr:
+        [E] vagy [E, F].
+        Az első feature az u -> v preferenciarangja.
+        Kisebb érték = jobb partner.
+
+    partner:
+        [N] tensor.
+        partner[u] = v, ha u és v párosítva vannak.
+        partner[u] = -1, ha u unmatched.
+
+    Returns
+    -------
+    blocking_pairs:
+        Python lista canonical párokkal:
+        [(min(u,v), max(u,v)), ...]
+    """
+    if edge_attr.ndim == 2:
+        ranks = edge_attr[:, 0]
+    elif edge_attr.ndim == 1:
+        ranks = edge_attr
+    else:
+        raise ValueError(
+            f"edge_attr shape-ja [E] vagy [E,F] legyen, "
+            f"de ez: {tuple(edge_attr.shape)}"
+        )
+
+    src = edge_index[0].detach().cpu().tolist()
+    dst = edge_index[1].detach().cpu().tolist()
+    ranks = ranks.detach().cpu().tolist()
+    partner = partner.detach().cpu().tolist()
+
+    # rank_of[u][v] = u milyen rankre teszi v-t.
+    rank_of = {}
+
+    for u, v, rank in zip(src, dst, ranks):
+        if u not in rank_of:
+            rank_of[u] = {}
+
+        rank_of[u][v] = float(rank)
+
+    def prefers(agent: int, candidate: int, current: int) -> bool:
+        """
+        True, ha agent a candidate-et szigorúan jobban preferálja,
+        mint a current partnert.
+
+        Ha unmatched, akkor minden elfogadható candidate jobb.
+        """
+        if candidate not in rank_of.get(agent, {}):
+            return False
+
+        if current == -1:
+            return True
+
+        # Ha a jelenlegi partner nincs a preferencialistán,
+        # tekintsd rossz / invalid partnernek.
+        if current not in rank_of.get(agent, {}):
+            return True
+
+        return rank_of[agent][candidate] < rank_of[agent][current]
+
+    blocking_pairs = []
+    seen = set()
+
+    for u, neighbors in rank_of.items():
+        current_u_partner = partner[u]
+
+        for v in neighbors:
+            # Self-loopokat hagyd ki.
+            if u == v:
+                continue
+
+            # Csak kölcsönös elfogadhatóság:
+            # u -> v ÉS v -> u is létezik.
+            if u not in rank_of.get(v, {}):
+                continue
+
+            # Ha már egymással vannak párosítva, nem blocking pair.
+            if current_u_partner == v:
+                continue
+
+            # Mivel u->v és v->u is bejárásra kerülne,
+            # egy canonical tuple-t használunk duplikáció ellen.
+            pair = (min(u, v), max(u, v))
+
+            if pair in seen:
+                continue
+
+            current_v_partner = partner[v]
+
+            u_prefers_v = prefers(
+                agent=u,
+                candidate=v,
+                current=current_u_partner,
+            )
+
+            v_prefers_u = prefers(
+                agent=v,
+                candidate=u,
+                current=current_v_partner,
+            )
+
+            if u_prefers_v and v_prefers_u:
+                blocking_pairs.append(pair)
+                seen.add(pair)
+
+    return blocking_pairs
 
 def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,GAT_TEST=False,LOCAL_LLM = False):
 
     group_size=3
 
     train_data = []
-    for j in range(100):
+    for j in range(1000):
         train_data.append(
             data_generator.graph_to_pyg_data_random(data_generator.generate_graph_m(group_size), group_size))
     val_data = []
@@ -486,37 +749,133 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
         hidden_dim=128,
         num_layers=4,
     )
+    train_enc = False
+    if train_enc:
+        optimizer = torch.optim.AdamW(
+            enc.parameters(),
+            lr=3e-4,
+            weight_decay=1e-4,
+        )
+        for epoch in range(100):
+            enc.train()
+            print("Epoch: " + str(epoch))
+            for batch in train_data:
+                out = enc(
+                    x=batch.x,
+                    edge_index=batch.edge_index,
+                    edge_attr=batch.edge_attr.float().unsqueeze(-1),
+                )
 
+                loss, metrics = encoder_loss(
+                    out=out,
+                    batch=batch,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    enc.parameters(),
+                    max_norm=1.0,
+                )
+
+                optimizer.step()
+        torch.save(enc.state_dict(), "enc.pt")
+    #enc.load_state_dict(torch.load("enc.pt", weights_only=True))
+    good = 0
+    bad = 0
+    dec = decoder.GreedyMatchingDecoder(
+        edge_embedding_dim=128,
+        hidden_dim=128,
+    )
     optimizer = torch.optim.AdamW(
-        enc.parameters(),
+        list(enc.parameters()) + list(dec.parameters()),
         lr=3e-4,
         weight_decay=1e-4,
     )
-    for epoch in range(100):
-        enc.train()
-        print("Epoch: " + str(epoch))
-        for batch in train_data:
+    """
+    dec_train=True
+    if dec_train:
+        for graph in train_data:
+            enc.eval()
+            dec.train()
             out = enc(
-                x=batch.x,
-                edge_index=batch.edge_index,
-                edge_attr=batch.edge_attr.float().unsqueeze(-1),
+                x=graph.x,
+                edge_index=graph.edge_index,
+                edge_attr=graph.edge_attr.float().unsqueeze(-1),
             )
-
-            loss, metrics = encoder_loss(
-                out=out,
-                batch=batch,
+            pair_logits=dec(out.edge_embedding)
+            loss = F.binary_cross_entropy_with_logits(
+                pair_logits,
+                graph.edge_y
             )
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_dec.zero_grad(set_to_none=True)
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
-                enc.parameters(),
+                dec.parameters(),
                 max_norm=1.0,
             )
+            print(loss)
+            optimizer_dec.step()
+        print("finished")
+        torch.save(dec.state_dict(), "dec.pt")
+    dec.load_state_dict(torch.load("dec.pt", weights_only=True))
+    """
+    enc.train()
+    dec.train()
+    for i in range(0,200):
+        for graph in train_data:
+            optimizer.zero_grad(set_to_none=True)
 
+            edge_attr = graph.edge_attr.float()
+            if edge_attr.ndim == 1:
+                edge_attr = edge_attr.unsqueeze(-1)
+
+            out = enc(
+                x=graph.x.float(),
+                edge_index=graph.edge_index,
+                edge_attr=edge_attr,
+            )
+
+            edge_logits = dec(
+                out.edge_embedding
+            )
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                edge_logits,
+                graph.edge_y
+            )
+            loss.backward()
             optimizer.step()
-    torch.save(enc.state_dict(), "enc.pt")
 
+    good = 0
+    bad = 0
+    for graph in train_data:
+        enc.eval()
+        dec.eval()
+        out = enc(
+            x=graph.x,
+            edge_index=graph.edge_index,
+            edge_attr=graph.edge_attr.float().unsqueeze(-1),
+        )
+        pair_logits = dec(out.edge_embedding)
+        partner = greedy_decode_pairs(
+            edge_index=graph.edge_index,
+            directed_logits=pair_logits,
+            num_nodes=6,
+            debug=False,
+        )
+        blocking_pairs = find_blocking_pairs(
+            edge_index=graph.edge_index,
+            edge_attr=graph.edge_attr,
+            partner=partner,
+        )
+        if len(blocking_pairs)==0:
+            good+=1
+        else:
+            bad += 1
+
+    print(good/(good+bad))
+    print("finished")
 
     """
     model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
