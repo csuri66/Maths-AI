@@ -267,7 +267,52 @@ def stable_matching_loss(
 
     return loss
 
+def preference_lists_to_edge_ranks(
+    preferences: dict[int, list[int]],
+    edge_index: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Preferencialistákból [E] rank tensor.
 
+    preferences[u] = [legjobb, ..., legrosszabb]
+
+    output[e] = rankja annak a partnernek, amelyhez
+    edge_index[:, e] = [u, v] tartozik.
+
+    0 = legjobb partner.
+    """
+    rank_dict = {
+        u: {
+            v: rank
+            for rank, v in enumerate(pref_list)
+        }
+        for u, pref_list in preferences.items()
+    }
+
+    values = []
+
+    for edge_id in range(edge_index.size(1)):
+        u = edge_index[0, edge_id].item()
+        v = edge_index[1, edge_id].item()
+
+        if u not in rank_dict:
+            raise KeyError(
+                f"A {u} node-hoz nincs preferencialista."
+            )
+
+        if v not in rank_dict[u]:
+            raise KeyError(
+                f"A {u} -> {v} él szerepel az edge_indexben, "
+                "de v nincs u preferencialistájában."
+            )
+
+        values.append(float(rank_dict[u][v]))
+
+    return torch.tensor(
+        values,
+        dtype=torch.float32,
+        device=edge_index.device,
+    )
 
 def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,model,optimizer,train_data,group_size,eval_every,val_data,patience,min_delta):
     for epoch in range(500):
@@ -425,24 +470,17 @@ def encoder_loss(
         pos_weight_membership,
         device=z.device,
     )
-    member_loss = F.binary_cross_entropy_with_logits(
-            out.auxiliary["stable_membership_logit"],
-            batch.edge_y,
-            pos_weight=pos_weight,
-    )
 
 
     total = (
-        1.0 * rank_loss
-        + 0.5 * mutual_loss
-        + 1.0 * member_loss
+        rank_loss
+        +   mutual_loss
     )
 
     metrics = {
         "loss": total.detach(),
         "rank_loss": rank_loss.detach(),
         "mutual_loss": mutual_loss.detach(),
-        "member_loss": member_loss.detach(),
     }
     return total, metrics
 
@@ -581,7 +619,208 @@ def greedy_decode_pairs(
 
     return partner
 
+def soft_blocking_pair_loss(
+    edge_index: torch.Tensor,
+    ranks: torch.Tensor,
+    directed_logits: torch.Tensor,
+    num_nodes: int,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Differenciálható soft blocking-pair loss.
 
+    Parameters
+    ----------
+    edge_index:
+        [2, E] directed preferenciaélek.
+
+    ranks:
+        [E] vagy [E, F].
+        ranks[e] = a source agent preferenciarangja a targetre.
+        Kisebb rank = jobb partner.
+
+    directed_logits:
+        [E], raw decoder logits.
+
+    num_nodes:
+        Node-ok száma.
+
+    temperature:
+        A sigmoid hőmérséklete.
+        Kisebb érték -> közelebb bináris kiválasztáshoz.
+
+    Returns
+    -------
+    Scalar tensor, amelyhez van gradient directed_logits felé.
+    """
+    if ranks.ndim == 2:
+        ranks = ranks[:, 0]
+
+    if ranks.ndim != 1:
+        raise ValueError(
+            "ranks shape-ja [E] vagy [E,F] legyen."
+        )
+
+    if directed_logits.ndim != 1:
+        raise ValueError(
+            "directed_logits shape-ja [E] legyen."
+        )
+
+    if edge_index.size(1) != directed_logits.numel():
+        raise ValueError(
+            "edge_index és directed_logits élszáma eltér."
+        )
+
+    device = directed_logits.device
+    dtype = directed_logits.dtype
+
+    src = edge_index[0]
+    dst = edge_index[1]
+    num_edges = edge_index.size(1)
+
+    # p(u -> v), differentiálható a decoder logitokra.
+    directed_prob = torch.sigmoid(
+        directed_logits / temperature
+    )  # [E]
+
+    # Python dict csak indexeket tárol, nem tensorértékeket:
+    # ettől a directed_prob felé a gradient nem szakad meg.
+    edge_id_of = {
+        (int(src[e].item()), int(dst[e].item())): e
+        for e in range(num_edges)
+    }
+
+    # Minden kölcsönös párra tároljuk:
+    # u, v, uv_eid, vu_eid, rank_u(v), rank_v(u)
+    pair_data = []
+
+    for (u, v), uv_eid in edge_id_of.items():
+        if u >= v:
+            continue
+
+        vu_eid = edge_id_of.get((v, u))
+
+        if vu_eid is None:
+            continue
+
+        pair_data.append(
+            (
+                u,
+                v,
+                uv_eid,
+                vu_eid,
+            )
+        )
+
+    if len(pair_data) == 0:
+        return directed_logits.sum() * 0.0
+
+    # P kölcsönös, irányítatlan candidate pair.
+    pair_u = torch.tensor(
+        [item[0] for item in pair_data],
+        dtype=torch.long,
+        device=device,
+    )
+    pair_v = torch.tensor(
+        [item[1] for item in pair_data],
+        dtype=torch.long,
+        device=device,
+    )
+
+    uv_eids = torch.tensor(
+        [item[2] for item in pair_data],
+        dtype=torch.long,
+        device=device,
+    )
+    vu_eids = torch.tensor(
+        [item[3] for item in pair_data],
+        dtype=torch.long,
+        device=device,
+    )
+
+    # p_{u,v}: mindkét irány magas legyen.
+    p_pair = (
+        directed_prob[uv_eids]
+        * directed_prob[vu_eids]
+    )  # [P]
+
+    rank_u_to_v = ranks[uv_eids]  # [P]
+    rank_v_to_u = ranks[vu_eids]  # [P]
+
+    total_loss = directed_logits.new_zeros(())
+
+    # Egyszerűség kedvéért P^2 ciklus.
+    # Kis graphokra / első debugra teljesen jó.
+    for p in range(len(pair_data)):
+        u = pair_u[p]
+        v = pair_v[p]
+
+        # Minden olyan pair q-t keresünk, amely:
+        # - u-t tartalmazza,
+        # - u a q másik endpointját v-nél rosszabbnak preferálja.
+        desire_u_for_v = directed_logits.new_zeros(())
+
+        # Ugyanez v oldalról.
+        desire_v_for_u = directed_logits.new_zeros(())
+
+        for q in range(len(pair_data)):
+            if p == q:
+                continue
+
+            a = pair_u[q]
+            b = pair_v[q]
+
+            # q = {u, w}; keressük rank_u(w)-t.
+            if a.item() == u.item():
+                w = b
+                q_rank_u_to_w = rank_u_to_v[q]
+
+                if rank_u_to_v[p] < q_rank_u_to_w:
+                    desire_u_for_v = (
+                        desire_u_for_v + p_pair[q]
+                    )
+
+            elif b.item() == u.item():
+                w = a
+                q_rank_u_to_w = rank_v_to_u[q]
+
+                if rank_u_to_v[p] < q_rank_u_to_w:
+                    desire_u_for_v = (
+                        desire_u_for_v + p_pair[q]
+                    )
+
+            # q = {v, z}; keressük rank_v(z)-t.
+            if a.item() == v.item():
+                z = b
+                q_rank_v_to_z = rank_u_to_v[q]
+
+                if rank_v_to_u[p] < q_rank_v_to_z:
+                    desire_v_for_u = (
+                        desire_v_for_u + p_pair[q]
+                    )
+
+            elif b.item() == v.item():
+                z = a
+                q_rank_v_to_z = rank_v_to_u[q]
+
+                if rank_v_to_u[p] < q_rank_v_to_z:
+                    desire_v_for_u = (
+                        desire_v_for_u + p_pair[q]
+                    )
+
+        # Ha p pair nem kiválasztott, és mindkét oldal
+        # soft módon rosszabb partnerhez van rendelve,
+        # akkor büntetjük.
+        blocking_mass = (
+            (1.0 - p_pair[p])
+            * desire_u_for_v
+            * desire_v_for_u
+        )
+
+        total_loss = total_loss + blocking_mass
+
+    # Az instance méretétől kevésbé függjön a loss.
+    return total_loss / len(pair_data)
 
 from typing import List, Tuple
 import torch
@@ -714,7 +953,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     group_size=3
 
     train_data = []
-    for j in range(1000):
+    for j in range(300):
         train_data.append(
             data_generator.graph_to_pyg_data_random(data_generator.generate_graph_m(group_size), group_size))
     val_data = []
@@ -746,7 +985,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     enc = encoder.StableMatchingEdgeEncoder(
         node_feature_dim=train_data[0].x.shape[1],
         edge_feature_dim=1,
-        hidden_dim=128,
+        hidden_dim=64,
         num_layers=4,
     )
     train_enc = False
@@ -781,15 +1020,13 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 optimizer.step()
         torch.save(enc.state_dict(), "enc.pt")
     #enc.load_state_dict(torch.load("enc.pt", weights_only=True))
-    good = 0
-    bad = 0
     dec = decoder.GreedyMatchingDecoder(
-        edge_embedding_dim=128,
-        hidden_dim=128,
+        edge_embedding_dim=66,
+        hidden_dim=66,
     )
     optimizer = torch.optim.AdamW(
-        list(enc.parameters()) + list(dec.parameters()),
-        lr=3e-4,
+        list(dec.parameters())+list(enc.parameters()),
+        lr=3e-3,
         weight_decay=1e-4,
     )
     """
@@ -823,7 +1060,8 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     """
     enc.train()
     dec.train()
-    for i in range(0,200):
+    for i in range(0,50):
+        print("Epoch: " + str(i))
         for graph in train_data:
             optimizer.zero_grad(set_to_none=True)
 
@@ -836,15 +1074,27 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 edge_index=graph.edge_index,
                 edge_attr=edge_attr,
             )
-
+            loss_enc, metrics = encoder_loss(
+                out=out,
+                batch=graph,
+            )
+            out.edge_embedding = torch.cat(
+                [
+                    out.edge_embedding,  # [E, 128]
+                    out.auxiliary["mutual_quality"].unsqueeze(-1),  # [E, 1]
+                    out.auxiliary["rank_score"].unsqueeze(-1),  # [E, 1]
+                ],
+                dim=-1,
+            )
             edge_logits = dec(
                 out.edge_embedding
             )
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                edge_logits,
-                graph.edge_y
-            )
-            loss.backward()
+            loss_solver = F.binary_cross_entropy_with_logits(edge_logits, graph.edge_y)
+            ranks = preference_lists_to_edge_ranks(graph.proposee_pref | graph.proposer_pref,graph.edge_index)
+            total_loss = loss_enc*0.5+ soft_blocking_pair_loss(
+                edge_index=graph.edge_index,ranks =ranks,directed_logits=edge_logits,num_nodes=6) +loss_solver*0.3
+
+            total_loss.backward()
             optimizer.step()
 
     good = 0
@@ -856,6 +1106,14 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
             x=graph.x,
             edge_index=graph.edge_index,
             edge_attr=graph.edge_attr.float().unsqueeze(-1),
+        )
+        out.edge_embedding = torch.cat(
+            [
+                out.edge_embedding,  # [E, 128]
+                out.auxiliary["mutual_quality"].unsqueeze(-1),  # [E, 1]
+                out.auxiliary["rank_score"].unsqueeze(-1),  # [E, 1]
+            ],
+            dim=-1,
         )
         pair_logits = dec(out.edge_embedding)
         partner = greedy_decode_pairs(

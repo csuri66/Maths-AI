@@ -1,5 +1,8 @@
 first goal: better performance on stable marriage
-Encoder fejek használata decoderben
+adatok eloszlása
+more heads
+decoder loss
+oldalasítás
 Decoder overhaul
 Eloszlások modifikálása
 tanitás gyorsitása
