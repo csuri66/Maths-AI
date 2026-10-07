@@ -315,6 +315,7 @@ def preference_lists_to_edge_ranks(
     )
 
 def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,model,optimizer,train_data,group_size,eval_every,val_data,patience,min_delta):
+    bad_checks = 0
     for epoch in range(500):
         model.train()
 
@@ -402,7 +403,7 @@ def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,m
                             lambda_stab=lambda_stab,
                             tau=tau
                         )
-                        val_loss_sum += val_loss
+                        val_loss_sum += val_loss.item()
                         val_count += 1
 
                 mean_val_loss = val_loss_sum / max(val_count, 1)
@@ -471,6 +472,15 @@ def encoder_loss(
         device=z.device,
     )
 
+    # Stable-membership supervisio: a stable_membership_logit head
+    # azt tanulja, hogy az él benne van-e a stabil párosításban.
+    # Cél: edge_y (1, ha az él a stabil matching része).
+    membership_logit = out.auxiliary["stable_membership_logit"]
+    membership_loss = F.binary_cross_entropy_with_logits(
+        membership_logit,
+        batch.edge_y.float(),
+        pos_weight=pos_weight,
+    )
 
     total = (
         rank_loss
@@ -481,6 +491,7 @@ def encoder_loss(
         "loss": total.detach(),
         "rank_loss": rank_loss.detach(),
         "mutual_loss": mutual_loss.detach(),
+        "membership_loss": membership_loss.detach(),
     }
     return total, metrics
 
@@ -953,13 +964,21 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     group_size=3
 
     train_data = []
-    for j in range(300):
+    for j in range(1000):
         train_data.append(
-            data_generator.graph_to_pyg_data_random(data_generator.generate_graph_m(group_size), group_size))
+            data_generator.graph_to_pyg_data_low_diff(
+                data_generator.generate_graph_m(group_size), group_size))
+
+
+
+
     val_data = []
-    for i in range(100):
+    for i in range(500):
         val_data.append(
-            data_generator.graph_to_pyg_data_random(data_generator.generate_graph_m(group_size), group_size))
+            data_generator.graph_to_pyg_data_low_diff(
+                data_generator.generate_graph_m(group_size), group_size))
+
+
 
 
 
@@ -985,85 +1004,144 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     enc = encoder.StableMatchingEdgeEncoder(
         node_feature_dim=train_data[0].x.shape[1],
         edge_feature_dim=1,
-        hidden_dim=64,
+        hidden_dim=16,
         num_layers=4,
     )
-    train_enc = False
-    if train_enc:
-        optimizer = torch.optim.AdamW(
-            enc.parameters(),
-            lr=3e-4,
-            weight_decay=1e-4,
-        )
-        for epoch in range(100):
-            enc.train()
-            print("Epoch: " + str(epoch))
-            for batch in train_data:
-                out = enc(
-                    x=batch.x,
-                    edge_index=batch.edge_index,
-                    edge_attr=batch.edge_attr.float().unsqueeze(-1),
-                )
-
-                loss, metrics = encoder_loss(
-                    out=out,
-                    batch=batch,
-                )
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(
-                    enc.parameters(),
-                    max_norm=1.0,
-                )
-
-                optimizer.step()
-        torch.save(enc.state_dict(), "enc.pt")
-    #enc.load_state_dict(torch.load("enc.pt", weights_only=True))
     dec = decoder.GreedyMatchingDecoder(
-        edge_embedding_dim=66,
-        hidden_dim=66,
+        edge_embedding_dim=18,
+        hidden_dim=18,
     )
-    optimizer = torch.optim.AdamW(
-        list(dec.parameters())+list(enc.parameters()),
+
+    # Külön optimizer a két fázishoz: az encoder és a decoder
+    # tanítása szét van választva, hogy ne egyszerre frissüljenek.
+    optimizer_enc = torch.optim.AdamW(
+        enc.parameters(),
+        lr=3e-4,
+        weight_decay=1e-4,
+    )
+    optimizer_dec = torch.optim.AdamW(
+        dec.parameters(),
         lr=3e-3,
         weight_decay=1e-4,
     )
-    """
-    dec_train=True
-    if dec_train:
-        for graph in train_data:
-            enc.eval()
-            dec.train()
-            out = enc(
-                x=graph.x,
-                edge_index=graph.edge_index,
-                edge_attr=graph.edge_attr.float().unsqueeze(-1),
-            )
-            pair_logits=dec(out.edge_embedding)
-            loss = F.binary_cross_entropy_with_logits(
-                pair_logits,
-                graph.edge_y
-            )
-            optimizer_dec.zero_grad(set_to_none=True)
-            loss.backward()
+    # Joint fine-tuning optimizer (3. fázis): mindkét modell egyszerre,
+    # kisebb learning rate-tel a stabil finomhangoláshoz.
+    optimizer_joint = torch.optim.AdamW(
+        list(enc.parameters()) + list(dec.parameters()),
+        lr=3e-4,
+        weight_decay=1e-4,
+    )
 
-            torch.nn.utils.clip_grad_norm_(
-                dec.parameters(),
-                max_norm=1.0,
-            )
-            print(loss)
-            optimizer_dec.step()
-        print("finished")
-        torch.save(dec.state_dict(), "dec.pt")
-    dec.load_state_dict(torch.load("dec.pt", weights_only=True))
-    """
-    enc.train()
-    dec.train()
-    for i in range(0,50):
-        print("Epoch: " + str(i))
+    def build_decoder_input(out):
+        return torch.cat(
+            [
+                out.edge_embedding,  # [E, 128]
+                out.auxiliary["mutual_quality"].unsqueeze(-1),  # [E, 1]
+                out.auxiliary["rank_score"].unsqueeze(-1),  # [E, 1]
+            ],
+            dim=-1,
+        )
+
+    def eval_encoder_loss(dataset):
+        enc.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for graph in dataset:
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+                loss, _ = encoder_loss(out=out, batch=graph)
+                total += loss.item()
+                count += 1
+        return total / max(count, 1)
+
+    def eval_decoder_loss(dataset):
+        dec.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for graph in dataset:
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+                edge_logits = dec(build_decoder_input(out))
+                loss_solver = F.binary_cross_entropy_with_logits(
+                    edge_logits, graph.edge_y
+                )
+                ranks = preference_lists_to_edge_ranks(
+                    graph.proposee_pref | graph.proposer_pref, graph.edge_index
+                )
+                loss_stab = soft_blocking_pair_loss(
+                    edge_index=graph.edge_index,
+                    ranks=ranks,
+                    directed_logits=edge_logits,
+                    num_nodes=graph.x.size(0),
+                )
+                total += (loss_solver * 0.5 + loss_stab * 0.3).item()
+                count += 1
+        return total / max(count, 1)
+
+    def eval_joint_loss(dataset):
+        enc.eval()
+        dec.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for graph in dataset:
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+                loss_enc, _ = encoder_loss(out=out, batch=graph)
+                edge_logits = dec(build_decoder_input(out))
+                loss_solver = F.binary_cross_entropy_with_logits(
+                    edge_logits, graph.edge_y
+                )
+                ranks = preference_lists_to_edge_ranks(
+                    graph.proposee_pref | graph.proposer_pref, graph.edge_index
+                )
+                loss_stab = soft_blocking_pair_loss(
+                    edge_index=graph.edge_index,
+                    ranks=ranks,
+                    directed_logits=edge_logits,
+                    num_nodes=graph.x.size(0),
+                )
+                total += (
+                    loss_enc * 0.5 + loss_solver * 0.5 + loss_stab * 0.3
+                ).item()
+                count += 1
+        return total / max(count, 1)
+
+    # Early stopping hiperparaméterek (mindhárom fázisra).
+    enc_patience = 10
+    dec_patience = 10
+    joint_patience = 10
+    min_delta = 1e-4
+
+
+    best_enc_val = float("inf")
+    enc_bad_checks = 0
+    enc_epoch_loss=0
+    for i in range(0, 1):
+        enc.train()
+        dec.eval()
         for graph in train_data:
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_enc.zero_grad(set_to_none=True)
 
             edge_attr = graph.edge_attr.float()
             if edge_attr.ndim == 1:
@@ -1078,28 +1156,163 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 out=out,
                 batch=graph,
             )
-            out.edge_embedding = torch.cat(
-                [
-                    out.edge_embedding,  # [E, 128]
-                    out.auxiliary["mutual_quality"].unsqueeze(-1),  # [E, 1]
-                    out.auxiliary["rank_score"].unsqueeze(-1),  # [E, 1]
-                ],
-                dim=-1,
-            )
-            edge_logits = dec(
-                out.edge_embedding
-            )
-            loss_solver = F.binary_cross_entropy_with_logits(edge_logits, graph.edge_y)
-            ranks = preference_lists_to_edge_ranks(graph.proposee_pref | graph.proposer_pref,graph.edge_index)
-            total_loss = loss_enc*0.5+ soft_blocking_pair_loss(
-                edge_index=graph.edge_index,ranks =ranks,directed_logits=edge_logits,num_nodes=6) +loss_solver*0.3
 
-            total_loss.backward()
-            optimizer.step()
+            loss_enc.backward()
+            torch.nn.utils.clip_grad_norm_(
+                enc.parameters(),
+                max_norm=1.0,
+            )
+            enc_epoch_loss=loss_enc.item()
+            optimizer_enc.step()
+
+        val_enc = eval_encoder_loss(val_data)
+        print("Encoder epoch: " + str(i) + " | val loss: " + str(val_enc) + "| train loss: " + str(enc_epoch_loss))
+
+        if val_enc < best_enc_val - min_delta:
+            best_enc_val = val_enc
+            enc_bad_checks = 0
+            torch.save(enc.state_dict(), "enc.pt")
+        else:
+            enc_bad_checks += 1
+            if enc_bad_checks >= enc_patience:
+                print("Encoder early stopping at epoch " + str(i))
+                break
+
+    # A legjobb (early-stopped) encoder súlyok visszatöltése a 2. fázishoz.
+    enc.load_state_dict(torch.load("enc.pt", weights_only=True))
+
+    best_dec_val = float("inf")
+    dec_bad_checks = 0
+    for i in range(0, 1):
+        enc.eval()
+        dec.train()
+        for graph in train_data:
+            optimizer_dec.zero_grad(set_to_none=True)
+
+            edge_attr = graph.edge_attr.float()
+            if edge_attr.ndim == 1:
+                edge_attr = edge_attr.unsqueeze(-1)
+
+            # Az encoder nem kap gradientet ebben a fázisban.
+            with torch.no_grad():
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+
+            edge_logits = dec(build_decoder_input(out))
+
+            loss_solver = F.binary_cross_entropy_with_logits(
+                edge_logits, graph.edge_y
+            )
+            ranks = preference_lists_to_edge_ranks(
+                graph.proposee_pref | graph.proposer_pref, graph.edge_index
+            )
+            loss_stab = soft_blocking_pair_loss(
+                edge_index=graph.edge_index,
+                ranks=ranks,
+                directed_logits=edge_logits,
+                num_nodes=graph.x.size(0),
+            )
+            loss_dec =  loss_solver + loss_stab
+            loss_dec.backward()
+            torch.nn.utils.clip_grad_norm_(
+                dec.parameters(),
+                max_norm=1.0,
+            )
+            optimizer_dec.step()
+
+        val_dec = eval_decoder_loss(val_data)
+        print("Decoder epoch: " + str(i) + " | val loss: " + str(val_dec))
+
+        if val_dec < best_dec_val - min_delta:
+            best_dec_val = val_dec
+            dec_bad_checks = 0
+            torch.save(dec.state_dict(), "dec.pt")
+        else:
+            dec_bad_checks += 1
+            if dec_bad_checks >= dec_patience:
+                print("Decoder early stopping at epoch " + str(i))
+                break
+
+    # A legjobb (early-stopped) decoder súlyok visszatöltése az értékeléshez.
+    dec.load_state_dict(torch.load("dec.pt", weights_only=True))
+
+    # =========================================================
+    # 3. FÁZIS: közös (joint) finomhangolás.
+    # Most már az encoder ÉS a decoder is egyszerre tanul, egy közös
+    # loss-on (encoder-loss + decoder-loss), kisebb learning rate-tel.
+    # A gradient a decoder logitokon keresztül az encoderbe is visszafolyik.
+    # Early stopping a közös validációs loss alapján.
+    # =========================================================
+
+    best_joint_val = float("inf")
+    joint_bad_checks = 0
+    for i in range(0, 200):
+        enc.train()
+        dec.train()
+        for graph in train_data:
+            optimizer_joint.zero_grad(set_to_none=True)
+
+            edge_attr = graph.edge_attr.float()
+            if edge_attr.ndim == 1:
+                edge_attr = edge_attr.unsqueeze(-1)
+
+            out = enc(
+                x=graph.x.float(),
+                edge_index=graph.edge_index,
+                edge_attr=edge_attr,
+            )
+            loss_enc, metrics = encoder_loss(
+                out=out,
+                batch=graph,
+            )
+
+            edge_logits = dec(build_decoder_input(out))
+
+            loss_solver = F.binary_cross_entropy_with_logits(
+                edge_logits, graph.edge_y
+            )
+            ranks = preference_lists_to_edge_ranks(
+                graph.proposee_pref | graph.proposer_pref, graph.edge_index
+            )
+            loss_stab = soft_blocking_pair_loss(
+                edge_index=graph.edge_index,
+                ranks=ranks,
+                directed_logits=edge_logits,
+                num_nodes=graph.x.size(0),
+            )
+            loss_joint = loss_enc * 0.5 + loss_solver * 0.5 + loss_stab * 0.3
+
+            loss_joint.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(enc.parameters()) + list(dec.parameters()),
+                max_norm=1.0,
+            )
+            optimizer_joint.step()
+
+        val_joint = eval_joint_loss(val_data)
+        print("Joint epoch: " + str(i) + " | val loss: " + str(val_joint))
+
+        if val_joint < best_joint_val - min_delta:
+            best_joint_val = val_joint
+            joint_bad_checks = 0
+            torch.save(enc.state_dict(), "enc.pt")
+            torch.save(dec.state_dict(), "dec.pt")
+        else:
+            joint_bad_checks += 1
+            if joint_bad_checks >= joint_patience:
+                print("Joint early stopping at epoch " + str(i))
+                break
+
+    # A legjobb (early-stopped) közös súlyok visszatöltése az értékeléshez.
+    enc.load_state_dict(torch.load("enc.pt", weights_only=True))
+    dec.load_state_dict(torch.load("dec.pt", weights_only=True))
 
     good = 0
     bad = 0
-    for graph in train_data:
+    for graph in val_data:
         enc.eval()
         dec.eval()
         out = enc(
@@ -1119,7 +1332,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
         partner = greedy_decode_pairs(
             edge_index=graph.edge_index,
             directed_logits=pair_logits,
-            num_nodes=6,
+            num_nodes=graph.x.size(0),
             debug=False,
         )
         blocking_pairs = find_blocking_pairs(
