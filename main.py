@@ -1,60 +1,18 @@
 import ast
-import torch
-from torch_geometric.data import Data
-import GAT
+import os
 import data_generator
-import torch.nn.functional as F
-import gale_shapley
 import random
 import encoder
 import decoder
-
-def build_current_data_from_original(original_data, remaining_orig_ids):
-    device = original_data.x.device
-    num_nodes = original_data.x.size(0)
-
-    if not isinstance(remaining_orig_ids, torch.Tensor):
-        remaining_orig_ids = torch.tensor(
-            list(remaining_orig_ids), dtype=torch.long, device=device
-        )
-    else:
-        remaining_orig_ids = remaining_orig_ids.to(device)
-
-    keep_node_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
-    keep_node_mask[remaining_orig_ids] = True
-
-    kept_orig_id = torch.arange(num_nodes, device=device)[keep_node_mask]
-
-    src, dst = original_data.edge_index
-    keep_edge_mask = keep_node_mask[src] & keep_node_mask[dst]
-
-    old_to_new = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
-    old_to_new[kept_orig_id] = torch.arange(kept_orig_id.numel(), device=device)
-
-    new_edge_index = original_data.edge_index[:, keep_edge_mask]
-    new_edge_index = old_to_new[new_edge_index]
-
-    current_data = Data(
-        x=original_data.x[keep_node_mask],
-        edge_index=new_edge_index,
-        edge_attr=original_data.edge_attr[keep_edge_mask]
-        if getattr(original_data, "edge_attr", None) is not None else None,
-        edge_y=original_data.edge_y[keep_edge_mask]
-        if getattr(original_data, "edge_y", None) is not None else None,
-        proposee_pref=filter_node_field(
-            getattr(original_data, "proposee_pref", None),
-            keep_node_mask,
-            old_to_new
-        ),
-        proposer_pref=filter_node_field(
-            getattr(original_data, "proposer_pref", None),
-            keep_node_mask,
-            old_to_new
-        ),
-        orig_id=kept_orig_id
-    )
-
-    return current_data
+from collections import Counter
+from dataclasses import dataclass
+from itertools import permutations
+import torch.nn.functional as F
+import torch
+import numpy as np
+from typing import Dict
+from typing import List, Tuple
+import random
 
 def best_pairing_for_selected_node(
     selected_nodes,
@@ -148,124 +106,549 @@ def best_pairing_for_selected_node(
     return chosen_e, (chosen_a, chosen_b)
 
 
-def filter_node_field(field, keep_node_mask, old_to_new=None):
-    if field is None:
-        return None
+@dataclass
+class MatchingRankingData:
+    uv_edge_ids: torch.Tensor       # [P]
+    vu_edge_ids: torch.Tensor       # [P]
+    matching_pair_ids: torch.Tensor # [K, n]
+    blocking_counts: torch.Tensor   # [K]
+    better_matching_ids: torch.Tensor  # [Q]
+    worse_matching_ids: torch.Tensor   # [Q]
+    num_edges: int
 
-    if isinstance(field, torch.Tensor):
-        return field[keep_node_mask]
+    def to(self, device):
+        return MatchingRankingData(
+            uv_edge_ids=self.uv_edge_ids.to(device),
+            vu_edge_ids=self.vu_edge_ids.to(device),
+            matching_pair_ids=self.matching_pair_ids.to(device),
+            blocking_counts=self.blocking_counts.to(device),
+            better_matching_ids=self.better_matching_ids.to(device),
+            worse_matching_ids=self.worse_matching_ids.to(device),
+            num_edges=self.num_edges,
+        )
 
-    if isinstance(field, list):
-        return [v for i, v in enumerate(field) if keep_node_mask[i].item()]
 
-    if isinstance(field, tuple):
-        return tuple(v for i, v in enumerate(field) if keep_node_mask[i].item())
-
-    if isinstance(field, dict):
-        new_field = {}
-        for old_idx, value in field.items():
-            if keep_node_mask[old_idx].item():
-                new_idx = int(old_to_new[old_idx].item()) if old_to_new is not None else old_idx
-                new_field[new_idx] = value
-        return new_field
-
-    return field
-
-def remove_best_pair_from_data(data, best_src, best_dst):
-    if not hasattr(data, "orig_id") or data.orig_id is None:
-        data.orig_id = torch.arange(data.x.size(0), device=data.x.device)
-
-    removed_original = data.orig_id[[best_src, best_dst]].tolist()
-
-    device = data.edge_index.device
-    num_nodes = data.x.size(0)
-
-    keep_node_mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
-    keep_node_mask[best_src] = False
-    keep_node_mask[best_dst] = False
-
-    src, dst = data.edge_index
-    keep_edge_mask = keep_node_mask[src] & keep_node_mask[dst]
-
-    old_to_new = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
-    old_to_new[keep_node_mask] = torch.arange(keep_node_mask.sum(), device=device)
-
-    new_edge_index = data.edge_index[:, keep_edge_mask]
-    new_edge_index = old_to_new[new_edge_index]
-
-    new_data = Data(
-        x=data.x[keep_node_mask],
-        edge_index=new_edge_index,
-        edge_attr=data.edge_attr[keep_edge_mask] if getattr(data, "edge_attr", None) is not None else None,
-        edge_y=data.edge_y[keep_edge_mask] if getattr(data, "edge_y", None) is not None else None,
-        proposee_pref=filter_node_field(getattr(data, "proposee_pref", None), keep_node_mask, old_to_new),
-        proposer_pref=filter_node_field(getattr(data, "proposer_pref", None), keep_node_mask, old_to_new),
-        orig_id=data.orig_id[keep_node_mask]
-    )
-
-    return new_data, removed_original
-
-def scatter_sum_1d(values, index, n):
-    out = values.new_zeros(n)
-    out.index_add_(0, index, values)
-    return out
-
-def soft_current_rank(probs, node_index, edge_rank, num_nodes):
-
-    mass = scatter_sum_1d(probs, node_index, num_nodes)
-
-    deg = scatter_sum_1d(torch.ones_like(probs), node_index, num_nodes)
-    unmatched_rank = deg
-
-    weighted_rank = scatter_sum_1d(probs * edge_rank, node_index, num_nodes)
-    unmatched_mass = (1.0 - mass).clamp(min=0.0)
-
-    denom = (mass + unmatched_mass).clamp(min=1e-8)
-    current_rank = (weighted_rank + unmatched_mass * unmatched_rank) / denom
-    return current_rank, mass
-
-def stable_matching_loss(
-    logits,
-    edge_label,
-    src,
-    dst,
-    rank_src,
-    rank_dst,
-    n_left,
-    n_right,
-    lambda_match,
-    lambda_stab,
-    tau
+def matching_ranking_loss(
+    directed_logits: torch.Tensor,
+    ranking_data: MatchingRankingData,
+    temperature: float = 1.0,
+    score_reg_weight: float = 1e-4,
 ):
-    probs = torch.sigmoid(logits)
+    """
+    directed_logits:
+        [E], a decoder raw outputja.
 
-    loss_edge = F.binary_cross_entropy_with_logits(
-            logits, edge_label
+    ranking_data:
+        Az adott gráfhoz előkészített matchingadat.
+
+    score_reg_weight:
+        Kis regularizáció a pair-score-ok túlzott
+        növekedésének korlátozására.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature legyen pozitív.")
+
+    if directed_logits.shape != (ranking_data.num_edges,):
+        raise ValueError(
+            f"Logit shape: [{ranking_data.num_edges}] szükséges, "
+            f"kapott: {tuple(directed_logits.shape)}"
+        )
+
+    # [P]: irányítatlan párok score-jai.
+    pair_logits = 0.5 * (
+        directed_logits[ranking_data.uv_edge_ids]
+        + directed_logits[ranking_data.vu_edge_ids]
+    )
+
+    # [K, n] -> [K]: teljes matchingek score-jai.
+    matching_scores = pair_logits[
+        ranking_data.matching_pair_ids
+    ].sum(dim=-1)
+
+    better_ids = ranking_data.better_matching_ids
+    worse_ids = ranking_data.worse_matching_ids
+
+    if better_ids.numel() == 0:
+        # Minden matching azonos minőségű:
+        # nincs ranking tanítójel.
+        rank_loss = directed_logits.sum() * 0.0
+    else:
+        better_scores = matching_scores[better_ids]
+        worse_scores = matching_scores[worse_ids]
+
+        rank_loss = F.softplus(
+            (worse_scores - better_scores) / temperature
+        ).mean()
+
+    score_reg = pair_logits.square().mean()
+
+    total = rank_loss + score_reg_weight * score_reg
+
+    with torch.no_grad():
+        best_id = matching_scores.argmax()
+        top1_blocking_count = ranking_data.blocking_counts[best_id]
+
+        if better_ids.numel() > 0:
+            ranking_accuracy = (
+                matching_scores[better_ids]
+                > matching_scores[worse_ids]
+            ).float().mean()
+        else:
+            ranking_accuracy = matching_scores.new_tensor(
+                float("nan")
+            )
+
+    metrics = {
+        "rank_loss": rank_loss.detach(),
+        "score_reg": score_reg.detach(),
+        "ranking_accuracy": ranking_accuracy.detach(),
+        "top1_blocking_count": top1_blocking_count.detach(),
+        "top1_stable": (top1_blocking_count == 0).detach(),
+    }
+
+    return total, metrics, matching_scores
+
+
+def prepare_matching_ranking_data(
+    edge_index: torch.Tensor,
+    edge_ranks: torch.Tensor,
+    num_nodes: int,
+    left_nodes: list[int],
+    right_nodes: list[int],
+) -> MatchingRankingData:
+    """
+    Előkészítés kis bipartit gráfokra.
+
+    edge_ranks:
+        [E], eredeti preferenciarangok.
+        Kisebb érték = jobb partner.
+
+    K:
+        Megengedett teljes matchingek száma.
+
+    Q:
+        Olyan rendezett matchingpárok száma, ahol
+        az első matching blocking-countja kisebb.
+    """
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError("edge_index shape-ja [2, E] legyen.")
+
+    ei = edge_index.detach().cpu()
+    ranks = edge_ranks.detach().cpu()
+
+    num_edges = ei.size(1)
+
+    if ranks.shape != (num_edges,):
+        raise ValueError("edge_ranks shape-ja [E] legyen.")
+
+    if len(left_nodes) != len(right_nodes):
+        raise ValueError("A két oldal mérete legyen azonos.")
+
+    if len(left_nodes) == 0:
+        raise ValueError("Legalább egy node kell oldalanként.")
+
+    all_nodes = left_nodes + right_nodes
+
+    if (
+        len(all_nodes) != num_nodes
+        or len(set(all_nodes)) != num_nodes
+        or set(all_nodes) != set(range(num_nodes))
+    ):
+        raise ValueError(
+            "A két oldal legyen diszjunkt, és fedje le "
+            "a 0..num_nodes-1 node-okat."
+        )
+
+    edge_id = {}
+
+    for eid, (u, v) in enumerate(ei.t().tolist()):
+        if (u, v) in edge_id:
+            raise ValueError(f"Duplikált irányított él: {(u, v)}")
+        edge_id[(u, v)] = eid
+
+    # A -> B orientációjú kölcsönös párjelöltek.
+    candidate_pairs = [
+        (u, v)
+        for u in left_nodes
+        for v in right_nodes
+        if (u, v) in edge_id and (v, u) in edge_id
+    ]
+
+    pair_id = {
+        pair: pid
+        for pid, pair in enumerate(candidate_pairs)
+    }
+
+    uv_edge_ids = torch.tensor(
+        [edge_id[(u, v)] for u, v in candidate_pairs],
+        dtype=torch.long,
+    )
+
+    vu_edge_ids = torch.tensor(
+        [edge_id[(v, u)] for u, v in candidate_pairs],
+        dtype=torch.long,
+    )
+
+    matching_pair_ids = []
+    blocking_counts = []
+
+    for right_order in permutations(right_nodes):
+        pairs = list(zip(left_nodes, right_order))
+
+        if any(pair not in pair_id for pair in pairs):
+            continue
+
+        partner = torch.full(
+            (num_nodes,),
+            -1,
+            dtype=torch.long,
+        )
+
+        for u, v in pairs:
+            partner[u] = v
+            partner[v] = u
+
+        blocking = find_blocking_pairs(
+            edge_index=ei,
+            edge_attr=ranks,
+            partner=partner,
+        )
+
+        matching_pair_ids.append(
+            [pair_id[pair] for pair in pairs]
+        )
+        blocking_counts.append(len(blocking))
+
+    if not matching_pair_ids:
+        raise ValueError(
+            "A gráfban nincs megengedett teljes matching."
+        )
+
+    matching_pair_ids = torch.tensor(
+        matching_pair_ids,
+        dtype=torch.long,
+    )
+
+    blocking_counts = torch.tensor(
+        blocking_counts,
+        dtype=torch.long,
+    )
+
+    # cost[i] < cost[j] esetén i-t magasabb score-ra tanítjuk.
+    comparison_mask = (
+        blocking_counts[:, None]
+        < blocking_counts[None, :]
+    )
+
+    better_ids, worse_ids = comparison_mask.nonzero(
+        as_tuple=True
+    )
+
+    return MatchingRankingData(
+        uv_edge_ids=uv_edge_ids,
+        vu_edge_ids=vu_edge_ids,
+        matching_pair_ids=matching_pair_ids,
+        blocking_counts=blocking_counts,
+        better_matching_ids=better_ids,
+        worse_matching_ids=worse_ids,
+        num_edges=num_edges,
     )
 
 
+def _enumerate_perfect_matchings(nodes):
+    """
+    Egy csomóponthalmaz ÖSSZES tökéletes párosítását felsorolja.
 
-    left_mass = scatter_sum_1d(probs, src, n_left)
-    right_mass = scatter_sum_1d(probs, dst, n_right)
+    A legkisebb indexű szabad node-ot párosítja minden más szabad
+    node-dal, rekurzívan. Minden párosítás kanonikus (min, max) párok
+    listája. A node-ok száma páros kell legyen; páratlan esetben üres.
+    """
+    if len(nodes) % 2 != 0:
+        return
 
-    loss_match = (
-        F.relu(left_mass - 1.0).pow(2).mean() +
-        F.relu(right_mass - 1.0).pow(2).mean()
+    if not nodes:
+        yield []
+        return
+
+    first = nodes[0]
+    rest = nodes[1:]
+
+    for i, partner in enumerate(rest):
+        pair = (min(first, partner), max(first, partner))
+        remaining = rest[:i] + rest[i + 1:]
+        for sub in _enumerate_perfect_matchings(remaining):
+            yield [pair] + sub
+
+
+def prepare_matching_ranking_data_roommate(
+    edge_index: torch.Tensor,
+    edge_ranks: torch.Tensor,
+    num_nodes: int,
+) -> MatchingRankingData:
+    """
+    A `prepare_matching_ranking_data` stabil-szobatárs (roommate)
+    változata: nincs bal/jobb oldal.
+
+    Minden kölcsönös (u,v) & (v,u) él párt lehetséges párosítás-jelöltnek
+    tekint, és felsorolja az ÖSSZES tökéletes párosítást a csomópontok
+    egyetlen halmazán (num_nodes páros kell legyen). A blocking-count-ot a
+    `find_blocking_pairs` adja, a visszatérési struktúra megegyezik a
+    páros esetben használttal, így a `matching_ranking_loss` változatlanul
+    működik.
+    """
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError("edge_index shape-ja [2, E] legyen.")
+
+    ei = edge_index.detach().cpu()
+    ranks = edge_ranks.detach().cpu()
+
+    num_edges = ei.size(1)
+
+    if ranks.shape != (num_edges,):
+        raise ValueError("edge_ranks shape-ja [E] legyen.")
+
+    if num_nodes % 2 != 0:
+        raise ValueError(
+            "Szobatárs tökéletes párosításhoz páros számú node kell."
+        )
+
+    edge_id = {}
+    for eid, (u, v) in enumerate(ei.t().tolist()):
+        if (u, v) in edge_id:
+            raise ValueError(f"Duplikált irányított él: {(u, v)}")
+        edge_id[(u, v)] = eid
+
+    # Kanonikus (min, max) párjelöltek, ahol mindkét irány létezik.
+    candidate_pairs = []
+    seen = set()
+    for (u, v) in edge_id:
+        pair = (min(u, v), max(u, v))
+        if pair in seen:
+            continue
+        a, b = pair
+        if (a, b) in edge_id and (b, a) in edge_id:
+            candidate_pairs.append(pair)
+            seen.add(pair)
+
+    pair_id = {pair: pid for pid, pair in enumerate(candidate_pairs)}
+
+    uv_edge_ids = torch.tensor(
+        [edge_id[(a, b)] for a, b in candidate_pairs],
+        dtype=torch.long,
+    )
+    vu_edge_ids = torch.tensor(
+        [edge_id[(b, a)] for a, b in candidate_pairs],
+        dtype=torch.long,
     )
 
-    curr_rank_left, _ = soft_current_rank(probs, src, rank_src, n_left)
-    curr_rank_right, _ = soft_current_rank(probs, dst, rank_dst, n_right)
+    matching_pair_ids = []
+    blocking_counts = []
 
-    better_for_left = torch.sigmoid((curr_rank_left[src] - rank_src.float()) / tau)
-    better_for_right = torch.sigmoid((curr_rank_right[dst] - rank_dst.float()) / tau)
+    for matching in _enumerate_perfect_matchings(list(range(num_nodes))):
+        if any(pair not in pair_id for pair in matching):
+            continue
 
-    not_selected = 1.0 - probs
+        partner = torch.full((num_nodes,), -1, dtype=torch.long)
+        for a, b in matching:
+            partner[a] = b
+            partner[b] = a
 
-    loss_stab = (not_selected * better_for_left * better_for_right).mean()
+        blocking = find_blocking_pairs(
+            edge_index=ei,
+            edge_attr=ranks,
+            partner=partner,
+        )
 
-    loss = loss_edge+ lambda_match * loss_match + lambda_stab * loss_stab
+        matching_pair_ids.append(
+            [pair_id[pair] for pair in matching]
+        )
+        blocking_counts.append(len(blocking))
 
-    return loss
+    if not matching_pair_ids:
+        raise ValueError(
+            "A gráfban nincs megengedett tökéletes szobatárs-párosítás."
+        )
+
+    matching_pair_ids = torch.tensor(
+        matching_pair_ids,
+        dtype=torch.long,
+    )
+    blocking_counts = torch.tensor(
+        blocking_counts,
+        dtype=torch.long,
+    )
+
+    comparison_mask = (
+        blocking_counts[:, None]
+        < blocking_counts[None, :]
+    )
+    better_ids, worse_ids = comparison_mask.nonzero(as_tuple=True)
+
+    return MatchingRankingData(
+        uv_edge_ids=uv_edge_ids,
+        vu_edge_ids=vu_edge_ids,
+        matching_pair_ids=matching_pair_ids,
+        blocking_counts=blocking_counts,
+        better_matching_ids=better_ids,
+        worse_matching_ids=worse_ids,
+        num_edges=num_edges,
+    )
+
+
+@dataclass
+class RankedMatching:
+    rank: int
+    pairs: list[tuple[int, int]]
+    score: float
+    partner: torch.Tensor
+    blocking_pairs: list[tuple[int, int]]
+
+    @property
+    def is_stable(self) -> bool:
+        return len(self.blocking_pairs) == 0
+
+
+@torch.no_grad()
+def rank_all_complete_matchings(
+    edge_index: torch.Tensor,
+    directed_logits: torch.Tensor,
+    edge_ranks: torch.Tensor,
+    num_nodes: int,
+    left_nodes: list[int],
+    right_nodes: list[int],
+) -> list[RankedMatching]:
+    """
+    Kis bipartit gráf összes megengedett teljes matchingjét
+    felsorolja és decoder-score szerint rangsorolja.
+
+    edge_index:
+        [2, E], irányított preferenciaélek.
+
+    directed_logits:
+        [E], a decoder nyers logitjai.
+
+    edge_ranks:
+        [E], az EREDETI preferenciarangok az edge_index sorrendjében.
+        Kisebb érték = jobb partner.
+
+    left_nodes, right_nodes:
+        A két oldal node ID-i.
+        Együtt pontosan a 0..num_nodes-1 node-okat fedjék le.
+
+    Return:
+        RankedMatching lista csökkenő össz-score szerint.
+
+    Fontos:
+        Faktorális számú jelöltet vizsgál.
+        Kis példányok diagnosztikájára való.
+    """
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError("edge_index shape-ja [2, E] legyen.")
+
+    num_edges = edge_index.size(1)
+
+    if directed_logits.shape != (num_edges,):
+        raise ValueError("directed_logits shape-ja [E] legyen.")
+
+    if edge_ranks.shape != (num_edges,):
+        raise ValueError("edge_ranks shape-ja [E] legyen.")
+
+    if len(left_nodes) != len(right_nodes):
+        raise ValueError(
+            "Teljes matchinghez a két oldal mérete legyen azonos."
+        )
+
+    all_nodes = left_nodes + right_nodes
+    if (
+        len(all_nodes) != num_nodes
+        or len(set(all_nodes)) != num_nodes
+        or set(all_nodes) != set(range(num_nodes))
+    ):
+        raise ValueError(
+            "A két oldal legyen diszjunkt, és fedje le "
+            "a 0..num_nodes-1 node-okat."
+        )
+
+    if not torch.isfinite(directed_logits).all().item():
+        raise ValueError("A logitok között NaN vagy inf szerepel.")
+
+    # A diagnosztika CPU-n fut.
+    ei = edge_index.detach().cpu()
+    logits = directed_logits.detach().cpu()
+    ranks = edge_ranks.detach().cpu()
+
+    directed_scores = {}
+
+    for eid, (u, v) in enumerate(ei.t().tolist()):
+        if (u, v) in directed_scores:
+            raise ValueError(f"Duplikált irányított él: {(u, v)}")
+
+        directed_scores[(u, v)] = float(logits[eid].item())
+
+    # Csak kölcsönösen elfogadható bipartit párjelöltek.
+    pair_scores = {}
+
+    for u in left_nodes:
+        for v in right_nodes:
+            if (
+                (u, v) in directed_scores
+                and (v, u) in directed_scores
+            ):
+                pair_scores[(u, v)] = 0.5 * (
+                    directed_scores[(u, v)]
+                    + directed_scores[(v, u)]
+                )
+
+    candidates = []
+
+    for right_order in permutations(right_nodes):
+        pairs = list(zip(left_nodes, right_order))
+
+        # Hiányzó kölcsönös él esetén ez nem megengedett matching.
+        if any(pair not in pair_scores for pair in pairs):
+            continue
+
+        score = sum(pair_scores[pair] for pair in pairs)
+
+        partner = torch.full(
+            (num_nodes,),
+            -1,
+            dtype=torch.long,
+        )
+
+        for u, v in pairs:
+            partner[u] = v
+            partner[v] = u
+
+        blocking_pairs = find_blocking_pairs(
+            edge_index=ei,
+            edge_attr=ranks,
+            partner=partner,
+        )
+
+        candidates.append(
+            RankedMatching(
+                rank=0,
+                pairs=pairs,
+                score=score,
+                partner=partner,
+                blocking_pairs=blocking_pairs,
+            )
+        )
+
+    # Egyező score-nál determinisztikus sorrend.
+    candidates.sort(
+        key=lambda result: (
+            -result.score,
+            tuple(result.pairs),
+        )
+    )
+
+    for rank, result in enumerate(candidates, start=1):
+        result.rank = rank
+
+    return candidates
+
 
 def preference_lists_to_edge_ranks(
     preferences: dict[int, list[int]],
@@ -313,120 +696,6 @@ def preference_lists_to_edge_ranks(
         dtype=torch.float32,
         device=edge_index.device,
     )
-
-def train(global_step,best_val_loss,stop_training,lambda_match,lambda_stab,tau,model,optimizer,train_data,group_size,eval_every,val_data,patience,min_delta):
-    bad_checks = 0
-    for epoch in range(500):
-        model.train()
-
-        for data in train_data:
-            optimizer.zero_grad()
-            logits = model(data)
-            src_global = data.edge_index[0]
-            dst_global = data.edge_index[1]
-            dst_local = data.edge_index[1] - group_size
-            proposer_rank = {
-                u: {partner: rank for rank, partner in enumerate(pref_list)}
-                for u, pref_list in data.proposer_pref.items()
-            }
-            proposee_rank = {
-                u: {partner: rank for rank, partner in enumerate(pref_list)}
-                for u, pref_list in data.proposee_pref.items()
-            }
-            rank_src = torch.tensor(
-                [proposer_rank[int(u)][int(vg)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
-                dtype=torch.float,
-                device=src_global.device
-            )
-            rank_dst = torch.tensor(
-                [proposee_rank[int(vg)][int(u)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
-                dtype=torch.float,
-                device=src_global.device
-            )
-            loss = stable_matching_loss(
-                logits=logits,
-                edge_label=data.edge_y.float(),
-                src=src_global,
-                dst=dst_local,
-                rank_src=rank_src,
-                rank_dst=rank_dst,
-                n_left=group_size,
-                n_right=group_size,
-                lambda_match=lambda_match,
-                lambda_stab=lambda_stab,
-                tau=tau
-            )
-            loss.backward()
-            optimizer.step()
-
-            global_step += 1
-
-            if global_step % eval_every == 0:
-                model.eval()
-                val_loss_sum = 0.0
-                val_count = 0
-
-                with torch.no_grad():
-                    for val in val_data:
-                        val_logits = model(val)
-                        src_global = val.edge_index[0]
-                        dst_global = val.edge_index[1]
-                        dst_local = val.edge_index[1] - group_size
-                        proposer_rank = {
-                            u: {partner: rank for rank, partner in enumerate(pref_list)}
-                            for u, pref_list in val.proposer_pref.items()
-                        }
-                        proposee_rank = {
-                            u: {partner: rank for rank, partner in enumerate(pref_list)}
-                            for u, pref_list in val.proposee_pref.items()
-                        }
-                        rank_src = torch.tensor(
-                            [proposer_rank[int(u)][int(vg)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
-                            dtype=torch.float,
-                            device=src_global.device
-                        )
-                        rank_dst = torch.tensor(
-                            [proposee_rank[int(vg)][int(u)] for u, vg in zip(src_global.tolist(), dst_global.tolist())],
-                            dtype=torch.float,
-                            device=src_global.device
-                        )
-                        val_loss  = stable_matching_loss(
-                            logits=val_logits,
-                            edge_label=val.edge_y.float(),
-                            src=src_global,
-                            dst=dst_local,
-                            rank_src=rank_src,
-                            rank_dst=rank_dst,
-                            n_left=group_size,
-                            n_right=group_size,
-                            lambda_match=lambda_match,
-                            lambda_stab=lambda_stab,
-                            tau=tau
-                        )
-                        val_loss_sum += val_loss.item()
-                        val_count += 1
-
-                mean_val_loss = val_loss_sum / max(val_count, 1)
-
-                if mean_val_loss < best_val_loss - min_delta:
-                    best_val_loss = mean_val_loss
-                    bad_checks = 0
-                    torch.save(model.state_dict(), "best_model.pt")
-                else:
-                    bad_checks += 1
-
-                model.train()
-
-                if bad_checks >= patience:
-                    print("Early stopping")
-                    stop_training = True
-                    break
-        if stop_training:
-            print(global_step)
-            print("BEST TOTAL LOSS")
-            print(best_val_loss)
-            break
-    return best_val_loss
 
 
 def encoder_loss(
@@ -495,7 +764,160 @@ def encoder_loss(
     }
     return total, metrics
 
-from typing import Dict
+
+class BlockingPairLoss(torch.nn.Module):
+    """
+    Egy fix gráfhoz előkészített blocking-pair surrogate loss.
+
+    Az edge_index sorrendjének training közben változatlannak
+    kell maradnia.
+    """
+
+    def __init__(
+        self,
+        edge_index: torch.Tensor,
+        edge_ranks: torch.Tensor,
+        num_nodes: int,
+        degree_weight: float = 1.0,
+        temperature: float = 1.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+
+        if temperature <= 0:
+            raise ValueError("temperature legyen pozitív.")
+
+        if reduction not in {"mean", "sum"}:
+            raise ValueError("reduction: 'mean' vagy 'sum'.")
+
+        if edge_index.ndim != 2 or edge_index.size(0) != 2:
+            raise ValueError("edge_index shape: [2, E].")
+
+        edge_ranks = edge_ranks.detach().cpu().reshape(-1)
+        edges = edge_index.detach().cpu().t().tolist()
+
+        if len(edges) != edge_ranks.numel():
+            raise ValueError("Az élek és rankek száma eltér.")
+
+        edge_id = {}
+
+        for eid, (u, v) in enumerate(edges):
+            if not (0 <= u < num_nodes and 0 <= v < num_nodes):
+                raise ValueError(f"Érvénytelen node ID: {(u, v)}")
+
+            if (u, v) in edge_id:
+                raise ValueError(f"Duplikált irányított él: {(u, v)}")
+
+            edge_id[(u, v)] = eid
+
+        pairs = [
+            (u, v)
+            for u, v in edges
+            if u < v and (v, u) in edge_id
+        ]
+
+        uv_ids = [edge_id[(u, v)] for u, v in pairs]
+        vu_ids = [edge_id[(v, u)] for u, v in pairs]
+
+        num_pairs = len(pairs)
+
+        # incidence[node, pair]: a node végpontja-e a párnak?
+        incidence = torch.zeros(num_nodes, num_pairs)
+
+        # better_u[p, q]:
+        # q pár u-nak jobb partnert ad-e, mint a p pár?
+        better_u = torch.zeros(num_pairs, num_pairs)
+        better_v = torch.zeros(num_pairs, num_pairs)
+
+        incident_pairs = [[] for _ in range(num_nodes)]
+
+        for q, (a, b) in enumerate(pairs):
+            incidence[a, q] = 1.0
+            incidence[b, q] = 1.0
+
+            incident_pairs[a].append((q, b))
+            incident_pairs[b].append((q, a))
+
+        for p, (u, v) in enumerate(pairs):
+            rank_uv = edge_ranks[edge_id[(u, v)]].item()
+            rank_vu = edge_ranks[edge_id[(v, u)]].item()
+
+            for q, w in incident_pairs[u]:
+                rank_uw = edge_ranks[edge_id[(u, w)]].item()
+                if rank_uw < rank_uv:
+                    better_u[p, q] = 1.0
+
+            for q, w in incident_pairs[v]:
+                rank_vw = edge_ranks[edge_id[(v, w)]].item()
+                if rank_vw < rank_vu:
+                    better_v[p, q] = 1.0
+
+        self.register_buffer(
+            "uv_ids", torch.tensor(uv_ids, dtype=torch.long)
+        )
+        self.register_buffer(
+            "vu_ids", torch.tensor(vu_ids, dtype=torch.long)
+        )
+        self.register_buffer("incidence", incidence)
+        self.register_buffer("better_u", better_u)
+        self.register_buffer("better_v", better_v)
+
+        self.num_edges = len(edges)
+        self.degree_weight = degree_weight
+        self.temperature = temperature
+        self.reduction = reduction
+
+    def forward(self, directed_logits: torch.Tensor):
+        if directed_logits.shape != (self.num_edges,):
+            raise ValueError(
+                f"directed_logits shape legyen ({self.num_edges},), "
+                f"kapott: {tuple(directed_logits.shape)}"
+            )
+
+        if self.uv_ids.numel() == 0:
+            zero = directed_logits.sum() * 0.0
+            return zero, {
+                "blocking": zero.detach(),
+                "degree": zero.detach(),
+            }
+
+        # Egyetlen score minden kölcsönös, irányítatlan párra.
+        pair_logits = 0.5 * (
+            directed_logits[self.uv_ids]
+            + directed_logits[self.vu_ids]
+        )
+
+        x = torch.sigmoid(pair_logits / self.temperature)
+
+        better_u = self.better_u.to(dtype=x.dtype)
+        better_v = self.better_v.to(dtype=x.dtype)
+        incidence = self.incidence.to(dtype=x.dtype)
+
+        better_mass_u = better_u @ x
+        better_mass_v = better_v @ x
+
+        desire_u = F.relu(1.0 - x - better_mass_u)
+        desire_v = F.relu(1.0 - x - better_mass_v)
+
+        blocking_per_pair = desire_u * desire_v
+
+        soft_degree = incidence @ x
+        degree_per_node = F.relu(soft_degree - 1.0).square()
+
+        if self.reduction == "mean":
+            blocking_loss = blocking_per_pair.mean()
+            degree_loss = degree_per_node.mean()
+        else:
+            blocking_loss = blocking_per_pair.sum()
+            degree_loss = degree_per_node.sum()
+
+        total = blocking_loss + self.degree_weight * degree_loss
+
+        return total, {
+            "blocking": blocking_loss.detach(),
+            "degree": degree_loss.detach(),
+        }
+
 
 @torch.no_grad()
 def greedy_decode_pairs(
@@ -635,7 +1057,7 @@ def soft_blocking_pair_loss(
     ranks: torch.Tensor,
     directed_logits: torch.Tensor,
     num_nodes: int,
-    temperature: float = 1.0,
+    temperature: float = 0.0001,
 ) -> torch.Tensor:
     """
     Differenciálható soft blocking-pair loss.
@@ -833,9 +1255,6 @@ def soft_blocking_pair_loss(
     # Az instance méretétől kevésbé függjön a loss.
     return total_loss / len(pair_data)
 
-from typing import List, Tuple
-import torch
-
 
 def find_blocking_pairs(
     edge_index: torch.Tensor,
@@ -959,30 +1378,112 @@ def find_blocking_pairs(
 
     return blocking_pairs
 
-def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,GAT_TEST=False,LOCAL_LLM = False):
+def get_or_generate_dataset(
+    group_size,
+    gen_fn,
+    n_train=1000,
+    n_val=500,
+    cache_path="dataset.pt",
+    seed=None,
+    graph_fn=None,
+):
+    """
+    Betölti a train/val adathalmazt lemezről, ha van cache; különben
+    egyszer legenerálja és elmenti.
+
+    Az adat NYERS (normalizálatlan) formában kerül mentésre, hogy a
+    normalizációs statisztikák (mean/std) minden futásban konzisztensen
+    újraszámolhatók legyenek.
+
+    gen_fn: a használt PyG-konverziós függvény, pl.
+            data_generator.graph_to_pyg_data_normal (páros/bipartite) vagy
+            data_generator.graph_to_pyg_data_r_normal (szobatárs/roommate).
+
+    graph_fn: a bázisgráf-generátor függvény. Ha None, akkor
+            data_generator.generate_graph_m (páros gráf). Szobatárs
+            esethez data_generator.generate_graph_r adható át.
+    """
+    if graph_fn is None:
+        graph_fn = data_generator.generate_graph_m
+
+    gen_name = getattr(gen_fn, "__name__", str(gen_fn))
+    graph_name = getattr(graph_fn, "__name__", str(graph_fn))
+
+    if os.path.exists(cache_path):
+        blob = torch.load(cache_path, weights_only=False)
+        if (
+            blob.get("group_size") == group_size
+            and blob.get("gen_name") == gen_name
+            and blob.get("graph_name") == graph_name
+            and len(blob["train_data"]) == n_train
+            and len(blob["val_data"]) == n_val
+        ):
+            print("Dataset betöltve innen: " + cache_path)
+            return blob["train_data"], blob["val_data"]
+        print("A cache paraméterei eltérnek a kérttől; újragenerálás.")
+
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+    train_data = [
+        gen_fn(graph_fn(group_size), group_size)
+        for _ in range(n_train)
+    ]
+    val_data = [
+        gen_fn(graph_fn(group_size), group_size)
+        for _ in range(n_val)
+    ]
+
+    torch.save(
+        {
+            "train_data": train_data,
+            "val_data": val_data,
+            "group_size": group_size,
+            "gen_name": gen_name,
+            "graph_name": graph_name,
+        },
+        cache_path,
+    )
+    print("Dataset legenerálva és elmentve ide: " + cache_path)
+    return train_data, val_data
+
+
+def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,GAT_TEST=False,LOCAL_LLM = False):
 
     group_size=3
 
-    train_data = []
-    for j in range(1000):
-        train_data.append(
-            data_generator.graph_to_pyg_data_low_diff(
-                data_generator.generate_graph_m(group_size), group_size))
+    if roommate:
+        # Stabil szobatárs (roommate) eset: nem-páros bázisgráf
+        # (generate_graph_r) és normális eloszlású preferenciák.
+        # A tökéletes szobatárs-párosításhoz PÁROS számú node kell, ezért
+        # 2*group_size node-ot használunk (a páros eset összes node-jával
+        # megegyező méret).
+        roommate_nodes = 2 * group_size
+        train_data, val_data = get_or_generate_dataset(
+            roommate_nodes,
+            gen_fn=data_generator.graph_to_pyg_data_r_normal,
+            graph_fn=data_generator.generate_graph_r,
+            n_train=500,
+            n_val=250,
+            cache_path="dataset_roommate.pt",
+            seed=42,
+        )
+    else:
+        # Páros (bipartite) eset: generate_graph_m bázisgráf.
+        train_data, val_data = get_or_generate_dataset(
+            group_size,
+            gen_fn=data_generator.graph_to_pyg_data_normal,
+            graph_fn=data_generator.generate_graph_m,
+            n_train=1000,
+            n_val=500,
+            cache_path="dataset.pt",
+            seed=42,
+        )
 
 
-
-
-    val_data = []
-    for i in range(500):
-        val_data.append(
-            data_generator.graph_to_pyg_data_low_diff(
-                data_generator.generate_graph_m(group_size), group_size))
-
-
-
-
-
-
+    """
     all_train_x = torch.cat([g.x for g in train_data], dim=0)
     all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
 
@@ -991,7 +1492,7 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
 
     std = all_train_x.std(dim=0, keepdim=True)
     std_edge =  all_train_edge.std(dim=0, keepdim=True)
-
+    
 
     for g in train_data:
         g.x = (g.x - mean) / std
@@ -1000,32 +1501,18 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
     for g in val_data:
         g.x = (g.x - mean) / std
         g.edge_attr = (g.edge_attr - mean_edge) / std_edge
-
+    """
     enc = encoder.StableMatchingEdgeEncoder(
         node_feature_dim=train_data[0].x.shape[1],
         edge_feature_dim=1,
-        hidden_dim=16,
-        num_layers=4,
+        hidden_dim=32,
+        num_layers=6,
     )
     dec = decoder.GreedyMatchingDecoder(
-        edge_embedding_dim=18,
-        hidden_dim=18,
+        edge_embedding_dim=34,
+        hidden_dim=34,
     )
 
-    # Külön optimizer a két fázishoz: az encoder és a decoder
-    # tanítása szét van választva, hogy ne egyszerre frissüljenek.
-    optimizer_enc = torch.optim.AdamW(
-        enc.parameters(),
-        lr=3e-4,
-        weight_decay=1e-4,
-    )
-    optimizer_dec = torch.optim.AdamW(
-        dec.parameters(),
-        lr=3e-3,
-        weight_decay=1e-4,
-    )
-    # Joint fine-tuning optimizer (3. fázis): mindkét modell egyszerre,
-    # kisebb learning rate-tel a stabil finomhangoláshoz.
     optimizer_joint = torch.optim.AdamW(
         list(enc.parameters()) + list(dec.parameters()),
         lr=3e-4,
@@ -1041,56 +1528,6 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
             ],
             dim=-1,
         )
-
-    def eval_encoder_loss(dataset):
-        enc.eval()
-        total = 0.0
-        count = 0
-        with torch.no_grad():
-            for graph in dataset:
-                edge_attr = graph.edge_attr.float()
-                if edge_attr.ndim == 1:
-                    edge_attr = edge_attr.unsqueeze(-1)
-                out = enc(
-                    x=graph.x.float(),
-                    edge_index=graph.edge_index,
-                    edge_attr=edge_attr,
-                )
-                loss, _ = encoder_loss(out=out, batch=graph)
-                total += loss.item()
-                count += 1
-        return total / max(count, 1)
-
-    def eval_decoder_loss(dataset):
-        dec.eval()
-        total = 0.0
-        count = 0
-        with torch.no_grad():
-            for graph in dataset:
-                edge_attr = graph.edge_attr.float()
-                if edge_attr.ndim == 1:
-                    edge_attr = edge_attr.unsqueeze(-1)
-                out = enc(
-                    x=graph.x.float(),
-                    edge_index=graph.edge_index,
-                    edge_attr=edge_attr,
-                )
-                edge_logits = dec(build_decoder_input(out))
-                loss_solver = F.binary_cross_entropy_with_logits(
-                    edge_logits, graph.edge_y
-                )
-                ranks = preference_lists_to_edge_ranks(
-                    graph.proposee_pref | graph.proposer_pref, graph.edge_index
-                )
-                loss_stab = soft_blocking_pair_loss(
-                    edge_index=graph.edge_index,
-                    ranks=ranks,
-                    directed_logits=edge_logits,
-                    num_nodes=graph.x.size(0),
-                )
-                total += (loss_solver * 0.5 + loss_stab * 0.3).item()
-                count += 1
-        return total / max(count, 1)
 
     def eval_joint_loss(dataset):
         enc.eval()
@@ -1109,207 +1546,275 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
                 )
                 loss_enc, _ = encoder_loss(out=out, batch=graph)
                 edge_logits = dec(build_decoder_input(out))
-                loss_solver = F.binary_cross_entropy_with_logits(
-                    edge_logits, graph.edge_y
-                )
+
                 ranks = preference_lists_to_edge_ranks(
                     graph.proposee_pref | graph.proposer_pref, graph.edge_index
                 )
-                loss_stab = soft_blocking_pair_loss(
+                criterion_eval = BlockingPairLoss(
                     edge_index=graph.edge_index,
-                    ranks=ranks,
-                    directed_logits=edge_logits,
-                    num_nodes=graph.x.size(0),
+                    edge_ranks=ranks,
+                    num_nodes=graph.num_nodes,
+                    degree_weight=1.0,
+                    temperature=0.01,
+                    reduction="mean",
                 )
+                loss_dec_eval, parts_ = criterion_eval(edge_logits)
                 total += (
-                    loss_enc * 0.5 + loss_solver * 0.5 + loss_stab * 0.3
+                    loss_enc*0.5 + loss_dec_eval*0.5
                 ).item()
                 count += 1
         return total / max(count, 1)
 
-    # Early stopping hiperparaméterek (mindhárom fázisra).
-    enc_patience = 10
-    dec_patience = 10
-    joint_patience = 10
+    joint_patience = 5
     min_delta = 1e-4
+    def prepare_dataset_ranking(
+            dataset,
+            left_nodes,
+            right_nodes,
+            roommate=False,
+    ):
+        ranking_dataset = []
 
-
-    best_enc_val = float("inf")
-    enc_bad_checks = 0
-    enc_epoch_loss=0
-    for i in range(0, 1):
-        enc.train()
-        dec.eval()
-        for graph in train_data:
-            optimizer_enc.zero_grad(set_to_none=True)
-
-            edge_attr = graph.edge_attr.float()
-            if edge_attr.ndim == 1:
-                edge_attr = edge_attr.unsqueeze(-1)
-
-            out = enc(
-                x=graph.x.float(),
-                edge_index=graph.edge_index,
-                edge_attr=edge_attr,
-            )
-            loss_enc, metrics = encoder_loss(
-                out=out,
-                batch=graph,
+        for graph in dataset:
+            preferences = (
+                    graph.proposee_pref | graph.proposer_pref
             )
 
-            loss_enc.backward()
-            torch.nn.utils.clip_grad_norm_(
-                enc.parameters(),
-                max_norm=1.0,
+            edge_ranks = preference_lists_to_edge_ranks(
+                preferences,
+                graph.edge_index,
             )
-            enc_epoch_loss=loss_enc.item()
-            optimizer_enc.step()
 
-        val_enc = eval_encoder_loss(val_data)
-        print("Encoder epoch: " + str(i) + " | val loss: " + str(val_enc) + "| train loss: " + str(enc_epoch_loss))
+            if roommate:
+                ranking_data = prepare_matching_ranking_data_roommate(
+                    edge_index=graph.edge_index,
+                    edge_ranks=edge_ranks,
+                    num_nodes=graph.num_nodes,
+                )
+            else:
+                ranking_data = prepare_matching_ranking_data(
+                    edge_index=graph.edge_index,
+                    edge_ranks=edge_ranks,
+                    num_nodes=graph.num_nodes,
+                    left_nodes=left_nodes,
+                    right_nodes=right_nodes,
+                )
 
-        if val_enc < best_enc_val - min_delta:
-            best_enc_val = val_enc
-            enc_bad_checks = 0
-            torch.save(enc.state_dict(), "enc.pt")
-        else:
-            enc_bad_checks += 1
-            if enc_bad_checks >= enc_patience:
-                print("Encoder early stopping at epoch " + str(i))
-                break
+            ranking_dataset.append(ranking_data)
 
-    # A legjobb (early-stopped) encoder súlyok visszatöltése a 2. fázishoz.
-    enc.load_state_dict(torch.load("enc.pt", weights_only=True))
+        return ranking_dataset
 
-    best_dec_val = float("inf")
-    dec_bad_checks = 0
-    for i in range(0, 1):
+
+    train_joint = False
+    if train_joint:
+        best_joint_val = float("inf")
+        joint_bad_checks = 0
+        for i in range(0, 200):
+            enc.train()
+            dec.train()
+            for graph in train_data:
+                optimizer_joint.zero_grad(set_to_none=True)
+
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
+
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+                loss_enc, metrics = encoder_loss(
+                    out=out,
+                    batch=graph,
+                )
+
+                edge_logits = dec(build_decoder_input(out))
+
+
+                ranks = preference_lists_to_edge_ranks(
+                    graph.proposee_pref | graph.proposer_pref, graph.edge_index
+                )
+                criterion_eval = BlockingPairLoss(
+                    edge_index=graph.edge_index,
+                    edge_ranks=ranks,
+                    num_nodes=graph.num_nodes,
+                    degree_weight=1.0,
+                    temperature=0.01,
+                    reduction="mean",
+                )
+                loss_dec_eval, parts_ = criterion_eval(edge_logits)
+                loss_joint = loss_enc*0.5  + loss_dec_eval*0.5
+
+                loss_joint.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(enc.parameters()) + list(dec.parameters()),
+                    max_norm=1.0,
+                )
+                optimizer_joint.step()
+
+            val_joint = eval_joint_loss(val_data)
+            print("Joint epoch: " + str(i) + " | val loss: " + str(val_joint))
+
+            if val_joint < best_joint_val - min_delta:
+                best_joint_val = val_joint
+                joint_bad_checks = 0
+                torch.save(enc.state_dict(), "enc.pt")
+                torch.save(dec.state_dict(), "dec.pt")
+            else:
+                joint_bad_checks += 1
+                if joint_bad_checks >= joint_patience:
+                    print("Joint early stopping at epoch " + str(i))
+                    break
+
+
+    optimizer_joint = torch.optim.AdamW(
+        list(enc.parameters()) + list(dec.parameters()),
+        lr=3e-4,
+        weight_decay=1e-4,
+    )
+    # Páros esetben a bal/jobb oldali node-ok a group_size-ból adódnak;
+    # szobatárs esetben nincs oldal-felosztás (a ranking-prep figyelmen
+    # kívül hagyja a left/right argumentumokat).
+    left_nodes = list(range(group_size))
+    right_nodes = list(range(group_size, 2 * group_size))
+
+    train_ranking = prepare_dataset_ranking(
+        train_data,
+        left_nodes,
+        right_nodes,
+        roommate=roommate,
+    )
+
+    val_ranking = prepare_dataset_ranking(
+        val_data,
+        left_nodes,
+        right_nodes,
+        roommate=roommate,
+    )
+
+    encoder_weight = 0.2
+    decoder_weight = 1.0
+
+    def eval_ranking_loss(dataset, ranking_dataset):
+        """
+        Validációs loss ugyanazzal a kombinált célfüggvénnyel, mint a
+        tanítás (encoder_loss + matching_ranking_loss), gradient nélkül.
+        """
         enc.eval()
-        dec.train()
-        for graph in train_data:
-            optimizer_dec.zero_grad(set_to_none=True)
+        dec.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for graph, ranking_data in zip(dataset, ranking_dataset):
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
 
-            edge_attr = graph.edge_attr.float()
-            if edge_attr.ndim == 1:
-                edge_attr = edge_attr.unsqueeze(-1)
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+                directed_logits = dec(build_decoder_input(out))
 
-            # Az encoder nem kap gradientet ebben a fázisban.
-            with torch.no_grad():
+                loss_enc, _ = encoder_loss(out=out, batch=graph)
+                loss_dec, _, _ = matching_ranking_loss(
+                    directed_logits=directed_logits,
+                    ranking_data=ranking_data,
+                    temperature=1.0,
+                    score_reg_weight=1e-4,
+                )
+                loss = (
+                    encoder_weight * loss_enc
+                    + decoder_weight * loss_dec
+                )
+                total += loss.item()
+                count += 1
+        return total / max(count, 1)
+
+    # Early stopping a validációs ranking-loss alapján.
+    ranking_patience = 15
+    ranking_min_delta = 1e-4
+    best_ranking_val = float("inf")
+    ranking_bad_checks = 0
+    best_ranking_epoch = -1
+    trainjoint=False
+    if trainjoint:
+        for epoch in range(5):
+            enc.train()
+            dec.train()
+
+            order = list(range(len(train_data)))
+            random.shuffle(order)
+
+            total_loss = 0.0
+            total_rank_loss = 0.0
+            total_encoder_loss = 0.0
+
+            for graph_id in order:
+                graph = train_data[graph_id]
+                ranking_data = train_ranking[graph_id]
+
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
+
+                optimizer_joint.zero_grad(set_to_none=True)
+
                 out = enc(
                     x=graph.x.float(),
                     edge_index=graph.edge_index,
                     edge_attr=edge_attr,
                 )
 
-            edge_logits = dec(build_decoder_input(out))
+                directed_logits = dec(build_decoder_input(out))
 
-            loss_solver = F.binary_cross_entropy_with_logits(
-                edge_logits, graph.edge_y
-            )
-            ranks = preference_lists_to_edge_ranks(
-                graph.proposee_pref | graph.proposer_pref, graph.edge_index
-            )
-            loss_stab = soft_blocking_pair_loss(
-                edge_index=graph.edge_index,
-                ranks=ranks,
-                directed_logits=edge_logits,
-                num_nodes=graph.x.size(0),
-            )
-            loss_dec =  loss_solver + loss_stab
-            loss_dec.backward()
-            torch.nn.utils.clip_grad_norm_(
-                dec.parameters(),
-                max_norm=1.0,
-            )
-            optimizer_dec.step()
+                loss_enc, _ = encoder_loss(
+                    out=out,
+                    batch=graph,
+                )
 
-        val_dec = eval_decoder_loss(val_data)
-        print("Decoder epoch: " + str(i) + " | val loss: " + str(val_dec))
+                loss_dec, metrics, _ = matching_ranking_loss(
+                    directed_logits=directed_logits,
+                    ranking_data=ranking_data,
+                    temperature=1.0,
+                    score_reg_weight=1e-4,
+                )
 
-        if val_dec < best_dec_val - min_delta:
-            best_dec_val = val_dec
-            dec_bad_checks = 0
-            torch.save(dec.state_dict(), "dec.pt")
-        else:
-            dec_bad_checks += 1
-            if dec_bad_checks >= dec_patience:
-                print("Decoder early stopping at epoch " + str(i))
-                break
+                loss = (
+                        encoder_weight * loss_enc
+                        + decoder_weight * loss_dec
+                )
 
-    # A legjobb (early-stopped) decoder súlyok visszatöltése az értékeléshez.
-    dec.load_state_dict(torch.load("dec.pt", weights_only=True))
+                loss.backward()
 
-    # =========================================================
-    # 3. FÁZIS: közös (joint) finomhangolás.
-    # Most már az encoder ÉS a decoder is egyszerre tanul, egy közös
-    # loss-on (encoder-loss + decoder-loss), kisebb learning rate-tel.
-    # A gradient a decoder logitokon keresztül az encoderbe is visszafolyik.
-    # Early stopping a közös validációs loss alapján.
-    # =========================================================
+                torch.nn.utils.clip_grad_norm_(
+                    list(enc.parameters()) + list(dec.parameters()),
+                    max_norm=1.0,
+                )
 
-    best_joint_val = float("inf")
-    joint_bad_checks = 0
-    for i in range(0, 200):
-        enc.train()
-        dec.train()
-        for graph in train_data:
-            optimizer_joint.zero_grad(set_to_none=True)
+                optimizer_joint.step()
 
-            edge_attr = graph.edge_attr.float()
-            if edge_attr.ndim == 1:
-                edge_attr = edge_attr.unsqueeze(-1)
+                total_loss += loss.item()
+                total_rank_loss += metrics["rank_loss"].item()
+                total_encoder_loss += loss_enc.item()
 
-            out = enc(
-                x=graph.x.float(),
-                edge_index=graph.edge_index,
-                edge_attr=edge_attr,
-            )
-            loss_enc, metrics = encoder_loss(
-                out=out,
-                batch=graph,
+            count = len(train_data)
+
+            print(
+                f"epoch={epoch} | "
+                f"train_total={total_loss / count:.6f} | "
+                f"train_enc={total_encoder_loss / count:.6f} | "
+                f"train_rank={total_rank_loss / count:.6f}"
             )
 
-            edge_logits = dec(build_decoder_input(out))
 
-            loss_solver = F.binary_cross_entropy_with_logits(
-                edge_logits, graph.edge_y
-            )
-            ranks = preference_lists_to_edge_ranks(
-                graph.proposee_pref | graph.proposer_pref, graph.edge_index
-            )
-            loss_stab = soft_blocking_pair_loss(
-                edge_index=graph.edge_index,
-                ranks=ranks,
-                directed_logits=edge_logits,
-                num_nodes=graph.x.size(0),
-            )
-            loss_joint = loss_enc * 0.5 + loss_solver * 0.5 + loss_stab * 0.3
-
-            loss_joint.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(enc.parameters()) + list(dec.parameters()),
-                max_norm=1.0,
-            )
-            optimizer_joint.step()
-
-        val_joint = eval_joint_loss(val_data)
-        print("Joint epoch: " + str(i) + " | val loss: " + str(val_joint))
-
-        if val_joint < best_joint_val - min_delta:
-            best_joint_val = val_joint
-            joint_bad_checks = 0
-            torch.save(enc.state_dict(), "enc.pt")
-            torch.save(dec.state_dict(), "dec.pt")
-        else:
-            joint_bad_checks += 1
-            if joint_bad_checks >= joint_patience:
-                print("Joint early stopping at epoch " + str(i))
-                break
 
     # A legjobb (early-stopped) közös súlyok visszatöltése az értékeléshez.
     enc.load_state_dict(torch.load("enc.pt", weights_only=True))
     dec.load_state_dict(torch.load("dec.pt", weights_only=True))
-
+    counts = []
     good = 0
     bad = 0
     for graph in val_data:
@@ -1335,195 +1840,216 @@ def main(training=False,roommate =  False,LLM_FILE_GEN = False,LLM_TEST = False,
             num_nodes=graph.x.size(0),
             debug=False,
         )
+        ranks = preference_lists_to_edge_ranks(
+            graph.proposee_pref | graph.proposer_pref,
+            graph.edge_index,
+        )
         blocking_pairs = find_blocking_pairs(
             edge_index=graph.edge_index,
-            edge_attr=graph.edge_attr,
+            edge_attr=ranks,
             partner=partner,
         )
+        counts.append(len(blocking_pairs))
+
+        # Olvasható párosítás: kanonikus (u, v) párok u < v szerint,
+        # plusz a párosítatlan node-ok külön.
+        partner_list = partner.detach().cpu().tolist()
+        matched_pairs = sorted(
+            {
+                (min(u, v), max(u, v))
+                for u, v in enumerate(partner_list)
+                if v != -1
+            }
+        )
+        unmatched = [
+            u for u, v in enumerate(partner_list) if v == -1
+        ]
+
+        print("Párosítás (matching pairs):", matched_pairs)
+        if unmatched:
+            print("Párosítatlan node-ok:", unmatched)
+
+        if blocking_pairs:
+            print(
+                f"Blokkoló párok ({len(blocking_pairs)}):",
+                sorted(blocking_pairs),
+            )
+        else:
+            print("Blokkoló párok: nincs (stabil párosítás)")
+
         if len(blocking_pairs)==0:
             good+=1
         else:
             bad += 1
-
+    print("Blocking-count eloszlás:", dict(sorted(Counter(counts).items())))
+    print("Átlag:", sum(counts) / len(counts))
+    print("Stabilitási arány:",
+          sum(c == 0 for c in counts) / len(counts))
     print(good/(good+bad))
     print("finished")
 
-    """
-    model = GAT.GATEdgeClassifier(train_data[0].x.size(-1), 16)
-    optimizer = torch.optim.Adagrad(model.parameters(), lr=0.015)
-
-
-    patience = 10
-    min_delta = 1e-4
-    eval_every = 10
-
-    best_val_loss = float("inf")
-    global_step = 0
-    stop_training = False
-
-
-    if training:
-        train(global_step, best_val_loss, stop_training, 0.2, 0.3, 0.5,model,optimizer,train_data, group_size, eval_every, val_data, patience, min_delta)
-    model.load_state_dict(torch.load("best_model.pt", weights_only=True))
-
-
-
-    model.eval()
-    
-
-    good=0
-    bad=0
-    if GAT_TEST:
-        with torch.no_grad():
-            for i in range(2500):
-                pair_dict = {}
-
-                group_size=3
-                acc_graph = data_generator.generate_graph_m(group_size)
-
-                structure = random.randint(0,100)
-                num = structure %2
-                match num:
-                    case 0:
-                        acc_data = data_generator.graph_to_pyg_data_low_diff(acc_graph, group_size)
-                    case 1:
-                        acc_data = data_generator.graph_to_pyg_data_high_diff(acc_graph, group_size)
-
-                acc_data.x = (acc_data.x - mean) / std
-                acc_data.edge_attr = (acc_data.edge_attr - mean_edge) / std_edge
-
-                logits = model(acc_data)
-                probs = torch.sigmoid(logits)
-                propr_pref=acc_data.proposer_pref
-                prope_pref = acc_data.proposee_pref
-                ag = propr_pref |prope_pref
-                original_data = acc_data
-                if not hasattr(original_data, "orig_id") or original_data.orig_id is None:
-                    original_data.orig_id = torch.arange(
-                        original_data.x.size(0),
-                        device=original_data.x.device
-                    )
-
-                remaining_orig_ids = original_data.orig_id.clone()
-
-                for i in range(group_size - 1):
-
-                    current_data = build_current_data_from_original(
-                        original_data,
-                        remaining_orig_ids
-                    )
-
-                    if i == 0:
-                        current_probs = probs
-                    else:
-                        logits = model(current_data)
-                        current_probs = torch.sigmoid(logits)
-                    best_e, (best_src, best_dst) = best_pairing_for_selected_node(
-                        selected_nodes=range(current_data.x.size(0)),
-                        edge_index=current_data.edge_index,
-                        edge_probs=current_probs,
-                        preference_lists=ag,
-                        tolerance=0.01
-                    )
-                    if best_e is None:
-                        break
-
-                    orig_u, orig_v = current_data.orig_id[[best_src, best_dst]].tolist()
-                    pair_dict[orig_u] = orig_v
-
-                    remaining_orig_ids = remaining_orig_ids[
-                        (remaining_orig_ids != orig_u) & (remaining_orig_ids != orig_v)
-                        ]
-
-                    if acc_graph.has_node(orig_u):
-                        acc_graph.remove_node(orig_u)
-                    if acc_graph.has_node(orig_v):
-                        acc_graph.remove_node(orig_v)
-
-                if remaining_orig_ids.numel() == 2:
-                    u, v = remaining_orig_ids.tolist()
-                    pair_dict[u] = v
-
-                if gale_shapley.is_stable_matching(pair_dict, propr_pref,  prope_pref):
-                    good += 1
-                else:
-                    bad += 1
-
-        print("GRAPH LEVEL ACCURACY GATv2 TEST")
-        print(f"Accuracy: {(good/(good+bad))*100} %")
-
-
+    # A teljes-matching rangsoroló kiértékelés (rank_all_complete_matchings)
+    # kizárólag páros gráfokra készült (left/right oldal). Szobatárs esetben
+    # a fenti blocking-count alapú kiértékelés adja a stabilitási metrikát,
+    # így itt kilépünk.
     if roommate:
-        print("Stable roommate case")
-        g_size = 4
-        graph_r = data_generator.generate_graph_r(g_size)
+        return
 
-        data_r = data_generator.graph_to_pyg_data_r_random(graph_r,g_size)
-        print(data_r.prefs)
-        print(data_r.x)
-        print(data_r.edge_attr)
-        data_r.x = (data_r.x - mean) / std
-        data_r.edge_attr = (data_r.edge_attr - mean_edge) / std_edge
-        logits = model(data_r)
-        probs = torch.sigmoid(logits)
-        print(probs)
+    enc.eval()
+    dec.eval()
 
-    if LLM_FILE_GEN:
-        with open("LLM_PREF_DATA_M.txt", "w", encoding="utf-8") as f:
-            for i in range(100):
-                low_diff = data_generator.graph_to_pyg_data_low_diff(data_generator.generate_graph_m(3), 3)
-                f.write(str(low_diff.proposer_pref)+";")
-                f.write(str(low_diff.proposee_pref)+ "\n")
-                high_diff=  data_generator.graph_to_pyg_data_high_diff(data_generator.generate_graph_m(3), 3)
-                f.write(str(high_diff.proposer_pref)+";")
-                f.write(str(high_diff.proposee_pref)+ "\n")
+    evaluated = 0
+    no_complete_matching = 0
+    no_stable_complete_matching = 0
 
-    good = 0
-    bad = 0
-    if LLM_TEST:
-        proposer_prefs = []
-        proposee_prefs = []
-        with open("LLM_PREF_DATA_M.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                prefs = line.strip().split(";")
-                proposer_prefs.append(ast.literal_eval(prefs[0]))
-                proposee_prefs.append(ast.literal_eval(prefs[1]))
-        index = 0
-        with open("stable_matchings_only.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                result = ast.literal_eval(line)
-                if gale_shapley.is_stable_matching(result, proposer_prefs[index], proposee_prefs[index]):
-                    good +=1
-                else:
-                    bad +=1
-                index += 1
-        print("GRAPH LEVEL ACCURACY LLM TEST")
-        print(good/(good+bad))
+    top1_stable = 0
+    best_stable_ranks = []
 
+    for graph in val_data:
+        with torch.no_grad():
+            edge_attr = graph.edge_attr.float()
 
-    if LOCAL_LLM:
-        import requests
+            if edge_attr.ndim == 1:
+                edge_attr = edge_attr.unsqueeze(-1)
 
-        prompts = []
-        with open("prompts_for_local_llm.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                prompts.append(line)
-
-        for i, prompt in enumerate(prompts, 1):
-            r = requests.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "mistral",
-                    "prompt": prompt,
-                    "stream": False
-                }
+            out = enc(
+                x=graph.x.float(),
+                edge_index=graph.edge_index,
+                edge_attr=edge_attr,
             )
-            data = r.json()
-            print(f"\n--- Prompt {i} ---")
-            print(prompt)
-            print("\n--- Válasz ---")
-            print(data["response"])
-    """
+
+            directed_logits = dec(build_decoder_input(out))
+
+        edge_ranks = preference_lists_to_edge_ranks(
+            graph.proposee_pref | graph.proposer_pref,
+            graph.edge_index,
+        )
+
+        results = rank_all_complete_matchings(
+            edge_index=graph.edge_index,
+            directed_logits=directed_logits,
+            edge_ranks=edge_ranks,
+            num_nodes=graph.num_nodes,
+            left_nodes=[0, 1, 2],
+            right_nodes=[3, 4, 5],
+        )
+
+        if not results:
+            no_complete_matching += 1
+            continue
+
+        evaluated += 1
+        top1_stable += int(results[0].is_stable)
+
+        stable_ranks = [
+            result.rank
+            for result in results
+            if result.is_stable
+        ]
+
+        if stable_ranks:
+            best_stable_ranks.append(stable_ranks[0])
+        else:
+            no_stable_complete_matching += 1
+
+    def print_matching_ranking(results: list[RankedMatching]):
+        if not results:
+            print("Nincs megengedett teljes matching.")
+            return
+
+        print("\nMatchingek össz-score szerint:")
+
+        for result in results:
+            print(
+                f"rank={result.rank} | "
+                f"score={result.score:+.6f} | "
+                f"stable={result.is_stable} | "
+                f"blocking_count={len(result.blocking_pairs)} | "
+                f"pairs={result.pairs}"
+            )
+
+        stable_ranks = [
+            result.rank
+            for result in results
+            if result.is_stable
+        ]
+
+        print("\nLegmagasabb score-ú matching:")
+        print(results[0].pairs)
+        print("Stabil:", results[0].is_stable)
+
+        print("Stabil matchingek ranghelyei:", stable_ranks)
+        print(
+            "Legjobb stabil matching ranghelye:",
+            stable_ranks[0] if stable_ranks else None,
+        )
+
+    enc.eval()
+    dec.eval()
+
+    graph = val_data[0]
+
+    with torch.no_grad():
+        edge_attr = graph.edge_attr.float()
+
+        if edge_attr.ndim == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+
+        out = enc(
+            x=graph.x.float(),
+            edge_index=graph.edge_index,
+            edge_attr=edge_attr,
+        )
+
+        directed_logits = dec(build_decoder_input(out))
+
+    # Az eredeti preferenciákból képzett rankek.
+    # Ne mutual-quality feature-t adj a checkernek.
+    edge_ranks = preference_lists_to_edge_ranks(
+        graph.proposee_pref | graph.proposer_pref,
+        graph.edge_index,
+    )
+
+    results = rank_all_complete_matchings(
+        edge_index=graph.edge_index,
+        directed_logits=directed_logits,
+        edge_ranks=edge_ranks,
+        num_nodes=graph.num_nodes,
+        left_nodes=[0, 1, 2],
+        right_nodes=[3, 4, 5],
+    )
+
+    print_matching_ranking(results)
+    print("Kiértékelt gráfok:", evaluated)
+    print("Teljes matching nélküli gráfok:", no_complete_matching)
+    print(
+        "Stabil teljes matching nélküli gráfok:",
+        no_stable_complete_matching,
+    )
+
+    if evaluated > 0:
+        print(
+            "Legmagasabb score-ú matching stabilitási aránya:",
+            top1_stable / evaluated,
+        )
+
+        print(
+            "Legjobb stabil matching rangeloszlása:",
+            dict(sorted(Counter(best_stable_ranks).items())),
+        )
+
+        # Jelöltlista-lefedettség, nem automatikus solver-pontosság.
+        for k in [1, 2, 3, 6]:
+            contains_stable = sum(
+                rank <= k
+                for rank in best_stable_ranks
+            )
+
+            print(
+                f"Top-{k} között van stabil matching: "
+                f"{contains_stable / evaluated:.3f}"
+            )
+
 
 if __name__ == "__main__":
     training = False
