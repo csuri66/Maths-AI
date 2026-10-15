@@ -4,7 +4,7 @@ import data_generator
 import random
 import encoder
 import decoder
-from collections import Counter
+from collections import Counter, deque, defaultdict
 from dataclasses import dataclass
 from itertools import permutations
 import torch.nn.functional as F
@@ -208,6 +208,466 @@ def matching_ranking_loss(
 
     return total, metrics, matching_scores
 
+# Legfeljebb ennyi teljes matchinget állítunk elő gráfonként. Ha a gráfnak
+# ennél több teljes matchingje van, akkor nem soroljuk fel mindet (ami
+# faktoriális lenne), hanem egy stabil matchingből kiindulva random
+# perturbációval mintázunk összesen MAX_SAMPLED_MATCHINGS darabot.
+MAX_SAMPLED_MATCHINGS = 10
+
+
+def _enumerate_matchings_from_pairs(nodes, allowed_pairs):
+    """
+    Felsorolja a `nodes` csomóponthalmaz azon tökéletes párosításait,
+    amelyek kizárólag `allowed_pairs`-beli (kanonikus (min,max)) párokat
+    használnak.
+
+    A legkisebb indexű szabad node-ot párosítja minden olyan szabad
+    node-dal, amellyel megengedett pár alkotható, rekurzívan. Minden
+    matching kanonikus párok rendezett listája.
+    """
+    if len(nodes) % 2 != 0:
+        return
+
+    if not nodes:
+        yield []
+        return
+
+    first = nodes[0]
+    rest = nodes[1:]
+
+    for i, partner in enumerate(rest):
+        pair = (min(first, partner), max(first, partner))
+        if pair not in allowed_pairs:
+            continue
+        remaining = rest[:i] + rest[i + 1:]
+        for sub in _enumerate_matchings_from_pairs(remaining, allowed_pairs):
+            yield [pair] + sub
+
+
+def _enumerate_matchings_with_cap(nodes, allowed_pairs, cap):
+    """
+    Lusta felsorolás korai leállással.
+
+    Visszatér: (matchings, exceeded)
+      matchings: legfeljebb `cap` darab teljes matching (kanonikus
+                 párlisták) listája.
+      exceeded:  True, ha a gráfnak `cap`-nél TÖBB teljes matchingje van
+                 (ekkor a matchings pontosan `cap` elemet tartalmaz).
+
+    Így a "<= cap vagy > cap" döntés pontos anélkül, hogy az összes
+    (akár faktoriális számú) matchinget materializálnánk.
+    """
+    matchings = []
+    for matching in _enumerate_matchings_from_pairs(nodes, allowed_pairs):
+        matchings.append(matching)
+        if len(matchings) > cap:
+            return matchings[:cap], True
+    return matchings, False
+
+
+def _matching_pairs_to_partner(matching, num_nodes):
+    """Kanonikus párlistából [num_nodes] partner-tensor (-1 = unmatched)."""
+    partner = torch.full((num_nodes,), -1, dtype=torch.long)
+    for a, b in matching:
+        partner[a] = b
+        partner[b] = a
+    return partner
+
+
+def _canonical_matching(partner_pairs):
+    """Párlistát kanonikus, rendezett alakra hoz (összehasonlíthatóság)."""
+    canon = sorted((min(a, b), max(a, b)) for a, b in partner_pairs)
+    return canon
+
+
+def _gale_shapley_matching(left_nodes, right_nodes, prefs, allowed_pairs):
+    """
+    Gale-Shapley stabil párosítás házassági (bipartit) esetre, kizárólag
+    preferencialistákból és a megengedett (kanonikus) párok halmazából.
+
+    left_nodes javasolnak. `prefs[node]` a node preferencialistája
+    (legjobb elöl). Csak azokat a jelölteket vesszük figyelembe, amelyek
+    `allowed_pairs`-beli párt alkotnak (azaz kölcsönösen elfogadható él).
+
+    Visszatér: kanonikus párlista. Lehet részleges, ha nincs teljes
+    stabil párosítás, de bipartit esetben az allowed_pairs definíció
+    szerint kölcsönös, így általában teljes.
+    """
+    right_set = set(right_nodes)
+
+    def pair_ok(u, v):
+        return (min(u, v), max(u, v)) in allowed_pairs
+
+    # Szűrt javaslati listák (sorrend megtartva).
+    proposer_list = {
+        u: [v for v in prefs.get(u, []) if v in right_set and pair_ok(u, v)]
+        for u in left_nodes
+    }
+
+    rank_right = {}
+    for v in right_nodes:
+        rank_right[v] = {
+            u: i
+            for i, u in enumerate(
+                [u for u in prefs.get(v, []) if pair_ok(u, v)]
+            )
+        }
+
+    match_left = {u: None for u in left_nodes}
+    match_right = {v: None for v in right_nodes}
+    next_idx = {u: 0 for u in left_nodes}
+
+    free = deque(left_nodes)
+
+    while free:
+        u = free.popleft()
+        if next_idx[u] >= len(proposer_list[u]):
+            continue
+        v = proposer_list[u][next_idx[u]]
+        next_idx[u] += 1
+
+        if v not in rank_right or u not in rank_right[v]:
+            # v nem fogadja el u-t: u marad szabad, próbál tovább.
+            free.append(u)
+            continue
+
+        current = match_right[v]
+        if current is None:
+            match_left[u] = v
+            match_right[v] = u
+        elif rank_right[v][u] < rank_right[v][current]:
+            match_left[current] = None
+            free.append(current)
+            match_left[u] = v
+            match_right[v] = u
+        else:
+            free.append(u)
+
+    pairs = [
+        (u, v) for u, v in match_left.items() if v is not None
+    ]
+    return _canonical_matching(pairs)
+
+
+def _irving_stable_roommate(nodes, prefs, allowed_pairs):
+    """
+    Irving algoritmusa a stabil szobatárs-problémára.
+
+    `prefs[x]` x preferencialistája (legjobb elöl). Csak az allowed_pairs-
+    beli (kölcsönösen elfogadható) jelölteket vesszük figyelembe.
+
+    Visszatér: kanonikus párlista, ha létezik stabil párosítás; egyébként
+    None.
+
+    Megvalósítás a klasszikus két fázis szerint:
+      1. fázis: javaslatok (proposal), amíg mindenki tart egy ajánlatot.
+      2. fázis: rotációk kiküszöbölése (rotation elimination).
+
+    A preferencialistákat szűkített alakban (`pref_list`) tartjuk; a lista
+    pozíciói helyett mindig az aktuális listában keresünk.
+    """
+    def pair_ok(a, b):
+        return (min(a, b), max(a, b)) in allowed_pairs
+
+    # Szűrt preferencialisták (sorrend megtartva, kölcsönös párok).
+    pref_list = {
+        x: [y for y in prefs.get(x, []) if y != x and pair_ok(x, y)]
+        for x in nodes
+    }
+
+    # Statikus rangok az EREDETI (szűrt) sorrend szerint, a redukció
+    # alatt is érvényesek maradnak az "x jobban preferálja a-t, mint b-t"
+    # összehasonlításokhoz.
+    rank = {
+        x: {y: i for i, y in enumerate(pref_list[x])}
+        for x in nodes
+    }
+
+    def prefers(x, a, b):
+        """x szigorúan jobban preferálja a-t, mint b-t."""
+        return rank[x][a] < rank[x][b]
+
+    def remove(a, b):
+        """Törli (a,b)-t mindkét fél listájából (szimmetrikusan)."""
+        if b in pref_list[a]:
+            pref_list[a].remove(b)
+        if a in pref_list[b]:
+            pref_list[b].remove(a)
+
+    # ---------- 1. fázis: javaslatok ----------
+    # proposed_from[y] = kitől tartja y a jelenlegi (legjobb) ajánlatot.
+    proposed_from = {x: None for x in nodes}
+
+    free = deque(nodes)
+    while free:
+        x = free.popleft()
+        # x csak akkor javasol, ha még nem tartja senki az ajánlatát.
+        if proposed_from_is_held(proposed_from, x):
+            continue
+        if not pref_list[x]:
+            return None  # x listája kiürült -> nincs stabil párosítás.
+
+        y = pref_list[x][0]  # x legjobb még megmaradt jelöltje
+        current = proposed_from[y]
+
+        if current is None:
+            proposed_from[y] = x
+        elif prefers(y, x, current):
+            # y jobban preferálja x-et: a korábbi javasló (current) kiesik.
+            proposed_from[y] = x
+            # current elveszti y-t: töröljük (current, y)-t és current újra
+            # szabad lesz.
+            remove(current, y)
+            free.append(current)
+        else:
+            # y elutasítja x-et: töröljük (x, y)-t, x próbál tovább.
+            remove(x, y)
+            free.append(x)
+
+    # Minden node tart valakit? Ha nem, nincs stabil párosítás.
+    if any(proposed_from[y] is None for y in nodes):
+        return None
+
+    # 1. fázis utáni listaszűkítés: ha y tartja x ajánlatát, akkor
+    #   - y listájából töröljük mindazokat, akiket y rosszabbnak tart x-nél,
+    #   - szimmetrikusan y-t is töröljük azok listájából.
+    for y in nodes:
+        x = proposed_from[y]
+        worse = [z for z in list(pref_list[y]) if z != x and prefers(y, x, z)]
+        for z in worse:
+            remove(y, z)
+
+    # ---------- 2. fázis: rotációk kiküszöbölése ----------
+    def all_singletons():
+        return all(len(pref_list[x]) == 1 for x in nodes)
+
+    def any_empty():
+        return any(len(pref_list[x]) == 0 for x in nodes)
+
+    max_iter = len(nodes) * len(nodes) + 10
+    it = 0
+    while not all_singletons() and it < max_iter:
+        it += 1
+        if any_empty():
+            return None
+
+        # Rotáció keresése: induljunk egy >= 2 hosszú listájú node-ból.
+        start = next((x for x in nodes if len(pref_list[x]) >= 2), None)
+        if start is None:
+            break
+
+        seq = []            # (x_i, y_i) párok
+        seen_index = {}
+        p = start
+        while p not in seen_index:
+            seen_index[p] = len(seq)
+            if len(pref_list[p]) < 2:
+                return None
+            # y_i = p második jelöltje
+            yi = pref_list[p][1]
+            seq.append((p, yi))
+            # következő p = y_i UTOLSÓ jelöltje
+            if not pref_list[yi]:
+                return None
+            p = pref_list[yi][-1]
+
+        cycle_start = seen_index[p]
+        rotation = seq[cycle_start:]
+
+        # Rotáció eliminálása: minden (x_i, y_i)-re y_i elutasítja az
+        # előző rotációs x-et. A standard lépés: y_i törli a párját a
+        # következő x-szel (ciklikusan), de a biztos megvalósításhoz
+        # minden y_i-ből töröljük azokat, akiket y_i x_{i+1}-nél (a
+        # következő javaslónál) rosszabbnak tart. Egyszerűbb, ekvivalens
+        # forma kis gráfokra: a rotációban szereplő (y_i, x_{i+1}) párokat
+        # töröljük.
+        m = len(rotation)
+        for i in range(m):
+            yi = rotation[i][1]
+            x_next = rotation[(i + 1) % m][0]
+            remove(yi, x_next)
+
+        if any_empty():
+            return None
+
+    if any_empty() or not all_singletons():
+        return None
+
+    pairs = []
+    for x in nodes:
+        y = pref_list[x][0]
+        if x < y:
+            pairs.append((x, y))
+
+    # Valódi teljes párosítás ellenőrzése.
+    matched = set()
+    for a, b in pairs:
+        matched.add(a)
+        matched.add(b)
+    if matched != set(nodes):
+        return None
+
+    return _canonical_matching(pairs)
+
+
+def proposed_from_is_held(proposed_from, x):
+    """True, ha valaki tartja x ajánlatát (azaz proposed_from[y] == x)."""
+    for y, who in proposed_from.items():
+        if who == x:
+            return True
+    return False
+
+
+def _random_perfect_matching(nodes, allowed_pairs, max_tries=200):
+    """
+    Véletlen teljes párosítás kizárólag `allowed_pairs`-beli párokból.
+
+    Backtracking + randomizált választás. Ha `max_tries` próbálkozásból
+    sem sikerül teljes párosítást találni, None-t ad vissza.
+    """
+    # Szomszédsági lista a megengedett párokból.
+    neighbors = {x: [] for x in nodes}
+    for (a, b) in allowed_pairs:
+        if a in neighbors and b in neighbors:
+            neighbors[a].append(b)
+            neighbors[b].append(a)
+
+    node_list = list(nodes)
+
+    def backtrack(free_set):
+        if not free_set:
+            return []
+        # A legkisebb indexű szabad node-ot párosítjuk.
+        x = min(free_set)
+        candidates = [y for y in neighbors[x] if y in free_set and y != x]
+        random.shuffle(candidates)
+        for y in candidates:
+            rest = free_set - {x, y}
+            sub = backtrack(rest)
+            if sub is not None:
+                return [(min(x, y), max(x, y))] + sub
+        return None
+
+    for _ in range(max_tries):
+        result = backtrack(set(node_list))
+        if result is not None:
+            return _canonical_matching(result)
+    return None
+
+
+def _perturb_matching(matching, nodes, allowed_pairs, max_tries=300):
+    """
+    Egy meglévő teljes matchingből random perturbációval ÚJ, érvényes
+    teljes matchinget állít elő.
+
+    Stratégia: véletlenszerűen kiválaszt két párt (a,b) és (c,d), majd
+    megpróbálja átcserélni őket úgy, hogy az új párok ((a,c),(b,d) vagy
+    (a,d),(b,c)) is megengedettek legyenek. Ha egyetlen swap sem ad új
+    érvényes matchinget, teljes random matchinggel próbálkozik.
+    """
+    def pair_ok(a, b):
+        return (min(a, b), max(a, b)) in allowed_pairs
+
+    base = {}
+    for a, b in matching:
+        base[a] = b
+        base[b] = a
+
+    pairs = list(matching)
+
+    for _ in range(max_tries):
+        if len(pairs) >= 2:
+            i, j = random.sample(range(len(pairs)), 2)
+            a, b = pairs[i]
+            c, d = pairs[j]
+            # Két lehetséges átkötés.
+            options = [
+                ((a, c), (b, d)),
+                ((a, d), (b, c)),
+            ]
+            random.shuffle(options)
+            for (p1, p2) in options:
+                if pair_ok(*p1) and pair_ok(*p2):
+                    new_pairs = list(pairs)
+                    new_pairs[i] = (min(p1), max(p1))
+                    new_pairs[j] = (min(p2), max(p2))
+                    canon = _canonical_matching(new_pairs)
+                    if canon != _canonical_matching(matching):
+                        return canon
+        # Fallback: teljesen random matching.
+        rnd = _random_perfect_matching(nodes, allowed_pairs, max_tries=50)
+        if rnd is not None and rnd != _canonical_matching(matching):
+            return rnd
+
+    return None
+
+
+def _sample_matchings(
+    nodes,
+    allowed_pairs,
+    roommate,
+    prefs,
+    left_nodes=None,
+    right_nodes=None,
+    target=MAX_SAMPLED_MATCHINGS,
+):
+    """
+    Egy stabil matchingből kiindulva (házasság: Gale-Shapley; szobatárs:
+    Irving, ha létezik stabil, különben random) random perturbációval
+    `target` darab KÜLÖNBÖZŐ teljes matchinget állít elő.
+
+    Visszatér: kanonikus párlisták listája (legfeljebb `target` elem).
+    """
+    collected = []
+    seen = set()
+
+    def add(m):
+        if m is None:
+            return False
+        key = tuple(m)
+        if key in seen:
+            return False
+        seen.add(key)
+        collected.append(m)
+        return True
+
+    # Kiindulási (stabil vagy random) matching.
+    if roommate:
+        base = _irving_stable_roommate(nodes, prefs, allowed_pairs)
+        if base is None:
+            base = _random_perfect_matching(nodes, allowed_pairs)
+    else:
+        base = _gale_shapley_matching(
+            left_nodes, right_nodes, prefs, allowed_pairs
+        )
+        # Ha a Gale-Shapley valamiért nem teljes, essünk vissza randomra.
+        if base is None or len(base) * 2 != len(nodes):
+            base = _random_perfect_matching(nodes, allowed_pairs)
+
+    if base is None:
+        return []
+
+    add(base)
+
+    # Perturbációk, amíg el nem érjük a target-et.
+    stale = 0
+    max_stale = target * 50
+    current = base
+    while len(collected) < target and stale < max_stale:
+        candidate = _perturb_matching(current, nodes, allowed_pairs)
+        if add(candidate):
+            stale = 0
+            current = candidate
+        else:
+            stale += 1
+            # Néha a bázisból indulva perturbáljunk újra a diverzitásért.
+            if stale % 10 == 0:
+                current = random.choice(collected)
+
+    return collected
+
+
+
 
 def prepare_matching_ranking_data(
     edge_index: torch.Tensor,
@@ -215,6 +675,7 @@ def prepare_matching_ranking_data(
     num_nodes: int,
     left_nodes: list[int],
     right_nodes: list[int],
+    preferences: dict[int, list[int]] | None = None,
 ) -> MatchingRankingData:
     """
     Előkészítés kis bipartit gráfokra.
@@ -223,8 +684,16 @@ def prepare_matching_ranking_data(
         [E], eredeti preferenciarangok.
         Kisebb érték = jobb partner.
 
+    preferences:
+        {node: [legjobb, ..., legrosszabb]} preferencialisták. Akkor kell,
+        ha a gráfnak MAX_SAMPLED_MATCHINGS-nél több teljes matchingje van:
+        ekkor nem soroljuk fel mindet, hanem egy Gale-Shapley stabil
+        matchingből kiindulva random perturbációval mintázunk
+        MAX_SAMPLED_MATCHINGS darabot.
+
     K:
-        Megengedett teljes matchingek száma.
+        A felhasznált teljes matchingek száma (<= MAX_SAMPLED_MATCHINGS, ha
+        a gráfnak több matchingje van, különben az összes).
 
     Q:
         Olyan rendezett matchingpárok száma, ahol
@@ -289,24 +758,56 @@ def prepare_matching_ranking_data(
         dtype=torch.long,
     )
 
+    # Kanonikus (min,max) párhalmaz a mintavételi segédekhez, és egy
+    # visszaképezés a kanonikus párból a bal->jobb orientált párra
+    # (pair_id kulcsa).
+    allowed_pairs = set()
+    canon_to_oriented = {}
+    for (u, v) in candidate_pairs:
+        canon = (min(u, v), max(u, v))
+        allowed_pairs.add(canon)
+        canon_to_oriented[canon] = (u, v)
+
+    # Döntés: legfeljebb MAX_SAMPLED_MATCHINGS teljes matchinget sorolunk
+    # fel korai leállással. Ha ennél több van, mintavételezünk.
+    enumerated, exceeded = _enumerate_matchings_with_cap(
+        all_nodes, allowed_pairs, MAX_SAMPLED_MATCHINGS
+    )
+
+    if exceeded:
+        if preferences is None:
+            raise ValueError(
+                "A gráfnak több teljes matchingje van, mint "
+                f"{MAX_SAMPLED_MATCHINGS}; a mintavételhez preferences kell."
+            )
+        canonical_matchings = _sample_matchings(
+            nodes=all_nodes,
+            allowed_pairs=allowed_pairs,
+            roommate=False,
+            prefs=preferences,
+            left_nodes=left_nodes,
+            right_nodes=right_nodes,
+            target=MAX_SAMPLED_MATCHINGS,
+        )
+    else:
+        canonical_matchings = enumerated
+
     matching_pair_ids = []
     blocking_counts = []
 
-    for right_order in permutations(right_nodes):
-        pairs = list(zip(left_nodes, right_order))
-
-        if any(pair not in pair_id for pair in pairs):
+    for matching in canonical_matchings:
+        # A kanonikus párokat visszaképezzük a bal->jobb orientált
+        # párokra, amelyekre a pair_id kulcsolva van.
+        try:
+            oriented = [canon_to_oriented[c] for c in matching]
+        except KeyError:
+            # Egy nem megengedett pár került bele: kihagyjuk.
             continue
 
-        partner = torch.full(
-            (num_nodes,),
-            -1,
-            dtype=torch.long,
-        )
+        if any(pair not in pair_id for pair in oriented):
+            continue
 
-        for u, v in pairs:
-            partner[u] = v
-            partner[v] = u
+        partner = _matching_pairs_to_partner(matching, num_nodes)
 
         blocking = find_blocking_pairs(
             edge_index=ei,
@@ -315,7 +816,7 @@ def prepare_matching_ranking_data(
         )
 
         matching_pair_ids.append(
-            [pair_id[pair] for pair in pairs]
+            [pair_id[pair] for pair in oriented]
         )
         blocking_counts.append(len(blocking))
 
@@ -384,17 +885,25 @@ def prepare_matching_ranking_data_roommate(
     edge_index: torch.Tensor,
     edge_ranks: torch.Tensor,
     num_nodes: int,
+    preferences: dict[int, list[int]] | None = None,
 ) -> MatchingRankingData:
     """
     A `prepare_matching_ranking_data` stabil-szobatárs (roommate)
     változata: nincs bal/jobb oldal.
 
     Minden kölcsönös (u,v) & (v,u) él párt lehetséges párosítás-jelöltnek
-    tekint, és felsorolja az ÖSSZES tökéletes párosítást a csomópontok
-    egyetlen halmazán (num_nodes páros kell legyen). A blocking-count-ot a
-    `find_blocking_pairs` adja, a visszatérési struktúra megegyezik a
-    páros esetben használttal, így a `matching_ranking_loss` változatlanul
-    működik.
+    tekint. Ha a gráfnak legfeljebb MAX_SAMPLED_MATCHINGS teljes
+    párosítása van, mindet felsoroljuk; ha több, akkor egy stabil
+    párosításból (Irving algoritmusa; ha nincs stabil, random matching)
+    kiindulva random perturbációval mintázunk MAX_SAMPLED_MATCHINGS
+    darabot. A blocking-count-ot a `find_blocking_pairs` adja, a
+    visszatérési struktúra megegyezik a páros esetben használttal, így a
+    `matching_ranking_loss` változatlanul működik.
+
+    preferences:
+        {node: [legjobb, ..., legrosszabb]} preferencialisták; a stabil
+        párosítás (Irving) kiszámításához kell, ha a gráfnak
+        MAX_SAMPLED_MATCHINGS-nél több teljes párosítása van.
     """
     if edge_index.ndim != 2 or edge_index.size(0) != 2:
         raise ValueError("edge_index shape-ja [2, E] legyen.")
@@ -441,17 +950,39 @@ def prepare_matching_ranking_data_roommate(
         dtype=torch.long,
     )
 
+    all_nodes = list(range(num_nodes))
+    allowed_pairs = set(candidate_pairs)  # már kanonikus (min,max) alak
+
+    # Döntés: legfeljebb MAX_SAMPLED_MATCHINGS teljes párosítást sorolunk
+    # fel korai leállással. Ha ennél több van, mintavételezünk.
+    enumerated, exceeded = _enumerate_matchings_with_cap(
+        all_nodes, allowed_pairs, MAX_SAMPLED_MATCHINGS
+    )
+
+    if exceeded:
+        if preferences is None:
+            raise ValueError(
+                "A gráfnak több teljes párosítása van, mint "
+                f"{MAX_SAMPLED_MATCHINGS}; a mintavételhez preferences kell."
+            )
+        canonical_matchings = _sample_matchings(
+            nodes=all_nodes,
+            allowed_pairs=allowed_pairs,
+            roommate=True,
+            prefs=preferences,
+            target=MAX_SAMPLED_MATCHINGS,
+        )
+    else:
+        canonical_matchings = enumerated
+
     matching_pair_ids = []
     blocking_counts = []
 
-    for matching in _enumerate_perfect_matchings(list(range(num_nodes))):
+    for matching in canonical_matchings:
         if any(pair not in pair_id for pair in matching):
             continue
 
-        partner = torch.full((num_nodes,), -1, dtype=torch.long)
-        for a, b in matching:
-            partner[a] = b
-            partner[b] = a
+        partner = _matching_pairs_to_partner(matching, num_nodes)
 
         blocking = find_blocking_pairs(
             edge_index=ei,
@@ -1386,6 +1917,7 @@ def get_or_generate_dataset(
     cache_path="dataset.pt",
     seed=None,
     graph_fn=None,
+    group_sizes=None,
 ):
     """
     Betölti a train/val adathalmazt lemezről, ha van cache; különben
@@ -1402,12 +1934,97 @@ def get_or_generate_dataset(
     graph_fn: a bázisgráf-generátor függvény. Ha None, akkor
             data_generator.generate_graph_m (páros gráf). Szobatárs
             esethez data_generator.generate_graph_r adható át.
+
+    group_sizes: ha None, minden mintát a fix `group_size`-zal generál.
+            Ha lista (pl. [6, 8, 10, 12] szobatárs node-számokra, vagy
+            [3, 4, 5, 6] páros oldalankénti létszámokra), akkor mintánként
+            véletlenszerűen választ belőle egy méretet, így a train és a
+            val split is vegyes méretű gráfokat tartalmaz. Ezáltal a
+            kiértékelés méret szerint is informatív.
     """
     if graph_fn is None:
         graph_fn = data_generator.generate_graph_m
 
     gen_name = getattr(gen_fn, "__name__", str(gen_fn))
     graph_name = getattr(graph_fn, "__name__", str(graph_fn))
+
+    if os.path.exists(cache_path):
+        blob = torch.load(cache_path, weights_only=False)
+        if (
+            blob.get("group_size") == group_size
+            and blob.get("group_sizes") == group_sizes
+            and blob.get("gen_name") == gen_name
+            and blob.get("graph_name") == graph_name
+            and len(blob["train_data"]) == n_train
+            and len(blob["val_data"]) == n_val
+        ):
+            print("Dataset betöltve innen: " + cache_path)
+            return blob["train_data"], blob["val_data"]
+        print("A cache paraméterei eltérnek a kérttől; újragenerálás.")
+
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+    def pick_size():
+        if group_sizes is None:
+            return group_size
+        return random.choice(group_sizes)
+
+    def make_sample():
+        gs = pick_size()
+        return gen_fn(graph_fn(gs), gs)
+
+    train_data = [make_sample() for _ in range(n_train)]
+    val_data = [make_sample() for _ in range(n_val)]
+
+    torch.save(
+        {
+            "train_data": train_data,
+            "val_data": val_data,
+            "group_size": group_size,
+            "group_sizes": group_sizes,
+            "gen_name": gen_name,
+            "graph_name": graph_name,
+        },
+        cache_path,
+    )
+    print("Dataset legenerálva és elmentve ide: " + cache_path)
+    return train_data, val_data
+
+
+def get_or_generate_mixed_dataset(
+    group_size,
+    n_train=1000,
+    n_val=500,
+    cache_path="dataset_mixed.pt",
+    seed=None,
+):
+    """
+    50/50 arányban kevert train/val adathalmazt készít szobatárs
+    (roommate) és házassági (marriage/bipartite) gráfokból.
+
+    Mindkét gráftípus azonos csomópontszámmal (2*group_size) jön létre,
+    és mindkét PyG-konverter (`graph_to_pyg_data_r_normal`,
+    `graph_to_pyg_data_normal`) azonos mezőkészletű `Data` objektumot ad
+    vissza (x, edge_index, edge_attr, edge_y, proposee_pref,
+    proposer_pref, rank_better_idx, rank_worse_idx), így a két típus egy
+    adathalmazban keverhető.
+
+    A minták véletlenszerűen keverednek (nem blokkokban), hogy a két típus
+    egyenletesen oszoljon el a tanítás során. Páratlan elemszámnál a
+    szobatárs-oldal kap eggyel többet.
+
+    Az adat NYERS (normalizálatlan) formában kerül mentésre, a
+    `get_or_generate_dataset`-tel megegyező cache-sémát követve.
+    """
+    # A train ÉS a val split is mintánként véletlen csoportméretet
+    # [3, 4, 5, 6] használ, így a kiértékelésnél méret szerint is látható
+    # a pontosság (lásd a build_split hívásokat lentebb).
+
+    gen_name = "mixed_roommate_marriage_50_50_valsizes_3456"
+    graph_name = "mixed(generate_graph_r+generate_graph_m)"
 
     if os.path.exists(cache_path):
         blob = torch.load(cache_path, weights_only=False)
@@ -1427,14 +2044,54 @@ def get_or_generate_dataset(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-    train_data = [
-        gen_fn(graph_fn(group_size), group_size)
-        for _ in range(n_train)
-    ]
-    val_data = [
-        gen_fn(graph_fn(group_size), group_size)
-        for _ in range(n_val)
-    ]
+    def build_split(n, group_sizes=None):
+        """
+        n mintából álló kevert (szobatárs + házassági) adathalmazt épít.
+
+        group_sizes: ha None, akkor a külső `group_size`-t használja minden
+            mintához (fix méret). Ha lista (pl. [3, 4, 5, 6]), akkor
+            mintánként véletlenszerűen választ belőle egy csoportméretet,
+            így a split vegyes méretű gráfokat tartalmaz.
+        """
+        # Páratlan n esetén a szobatárs kap eggyel többet.
+        n_roommate = (n + 1) // 2
+        n_marriage = n - n_roommate
+
+        def pick_group_size():
+            if group_sizes is None:
+                return group_size
+            return random.choice(group_sizes)
+
+        samples = []
+
+        for _ in range(n_roommate):
+            gs = pick_group_size()
+            r_nodes = 2 * gs
+            G = data_generator.generate_graph_r(r_nodes)
+            samples.append(
+                data_generator.graph_to_pyg_data_r_normal(
+                    G, r_nodes
+                )
+            )
+
+        for _ in range(n_marriage):
+            gs = pick_group_size()
+            G = data_generator.generate_graph_m(gs)
+            samples.append(
+                data_generator.graph_to_pyg_data_normal(
+                    G, gs
+                )
+            )
+
+        # Véletlenszerű keverés, hogy a két típus ne blokkokban álljon.
+        random.shuffle(samples)
+        return samples
+
+    # Train és Val: vegyes csoportméretek (3, 4, 5, 6) mintánként
+    # véletlenszerűen, hogy a kiértékelés méret szerint is informatív
+    # legyen (lásd a méret szerinti metrikákat a kiértékelésben).
+    train_data = build_split(n_train, group_sizes=[3, 4, 5, 6])
+    val_data = build_split(n_val, group_sizes=[3, 4, 5, 6])
 
     torch.save(
         {
@@ -1450,25 +2107,44 @@ def get_or_generate_dataset(
     return train_data, val_data
 
 
-def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,GAT_TEST=False,LOCAL_LLM = False):
+def main(training=False, roommate=True, mixed=False):
 
     group_size=3
 
-    if roommate:
+    if mixed:
+        # 50/50 keverék: szobatárs (roommate) és házassági (marriage)
+        # gráfok egy adathalmazban. A ranking-prep és a kiértékelés
+        # per-gráf dönti el a típust (lásd lentebb a `is_roommate_graph`
+        # detektálást a proposee_pref üres volta alapján).
+        train_data, val_data = get_or_generate_mixed_dataset(
+            group_size,
+            n_train=1000,
+            n_val=500,
+            cache_path="dataset_mixed.pt",
+            seed=42,
+        )
+    elif roommate:
         # Stabil szobatárs (roommate) eset: nem-páros bázisgráf
         # (generate_graph_r) és normális eloszlású preferenciák.
         # A tökéletes szobatárs-párosításhoz PÁROS számú node kell, ezért
         # 2*group_size node-ot használunk (a páros eset összes node-jával
         # megegyező méret).
+        #
+        # Vegyes méretek: mintánként véletlenszerűen választunk a
+        # [6, 8, 10, 12] node-számok közül (ezek a 3, 4, 5, 6 oldalankénti
+        # létszámok kétszeresei), így a kiértékelés méret szerint is
+        # informatív (lásd a méret szerinti metrikákat a kiértékelésben).
+        # A `group_size` csak a cache-kulcs része / fallback marad.
         roommate_nodes = 2 * group_size
         train_data, val_data = get_or_generate_dataset(
             roommate_nodes,
             gen_fn=data_generator.graph_to_pyg_data_r_normal,
             graph_fn=data_generator.generate_graph_r,
-            n_train=500,
-            n_val=250,
+            n_train=1000,
+            n_val=500,
             cache_path="dataset_roommate.pt",
             seed=42,
+            group_sizes=[2 * gs for gs in (3, 4, 5, 6)],
         )
     else:
         # Páros (bipartite) eset: generate_graph_m bázisgráf.
@@ -1483,25 +2159,9 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
         )
 
 
-    """
-    all_train_x = torch.cat([g.x for g in train_data], dim=0)
-    all_train_edge = torch.cat([g.edge_attr for g in train_data], dim=0)
 
-    mean = all_train_x.mean(dim=0, keepdim=True)
-    mean_edge = all_train_edge.mean(dim=0, keepdim=True)
 
-    std = all_train_x.std(dim=0, keepdim=True)
-    std_edge =  all_train_edge.std(dim=0, keepdim=True)
-    
 
-    for g in train_data:
-        g.x = (g.x - mean) / std
-        g.edge_attr=(g.edge_attr - mean_edge) / std_edge
-
-    for g in val_data:
-        g.x = (g.x - mean) / std
-        g.edge_attr = (g.edge_attr - mean_edge) / std_edge
-    """
     enc = encoder.StableMatchingEdgeEncoder(
         node_feature_dim=train_data[0].x.shape[1],
         edge_feature_dim=1,
@@ -1511,12 +2171,6 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
     dec = decoder.GreedyMatchingDecoder(
         edge_embedding_dim=34,
         hidden_dim=34,
-    )
-
-    optimizer_joint = torch.optim.AdamW(
-        list(enc.parameters()) + list(dec.parameters()),
-        lr=3e-4,
-        weight_decay=1e-4,
     )
 
     def build_decoder_input(out):
@@ -1567,11 +2221,23 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
 
     joint_patience = 5
     min_delta = 1e-4
+
+    def is_roommate_graph(graph):
+        """
+        Egy gráf szobatárs-típusú-e. A `graph_to_pyg_data_r_normal` üres
+        proposee_pref-et ad (nincs oldal-felosztás), míg a házassági
+        (bipartite) konverterek kitöltik mindkét oldalt. Ez alapján
+        dönthető el per-gráf a típus a kevert adathalmazban.
+        """
+        proposee = getattr(graph, "proposee_pref", None)
+        return not proposee
+
     def prepare_dataset_ranking(
             dataset,
             left_nodes,
             right_nodes,
             roommate=False,
+            mixed=False,
     ):
         ranking_dataset = []
 
@@ -1585,87 +2251,46 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
                 graph.edge_index,
             )
 
-            if roommate:
+            # Kevert adathalmaznál per-gráf dönt a típus; egyébként a
+            # globális `roommate` flag.
+            use_roommate = (
+                is_roommate_graph(graph) if mixed else roommate
+            )
+
+            if use_roommate:
                 ranking_data = prepare_matching_ranking_data_roommate(
                     edge_index=graph.edge_index,
                     edge_ranks=edge_ranks,
                     num_nodes=graph.num_nodes,
+                    preferences=preferences,
                 )
             else:
+                # Páros (marriage) gráfnál a bal/jobb oldali node-okat
+                # per-gráf a saját méretéből származtatjuk, hogy a vegyes
+                # méretű train adathalmaz (group_size 3..6) is helyes
+                # oldal-felosztást kapjon. A konverter (generate_graph_m +
+                # graph_to_pyg_data_normal) a 0..n-1 node-okat teszi a bal,
+                # az n..2n-1 node-okat a jobb oldalra, ahol n = num_nodes/2.
+                if mixed:
+                    half = graph.num_nodes // 2
+                    g_left_nodes = list(range(half))
+                    g_right_nodes = list(range(half, graph.num_nodes))
+                else:
+                    g_left_nodes = left_nodes
+                    g_right_nodes = right_nodes
+
                 ranking_data = prepare_matching_ranking_data(
                     edge_index=graph.edge_index,
                     edge_ranks=edge_ranks,
                     num_nodes=graph.num_nodes,
-                    left_nodes=left_nodes,
-                    right_nodes=right_nodes,
+                    left_nodes=g_left_nodes,
+                    right_nodes=g_right_nodes,
+                    preferences=preferences,
                 )
 
             ranking_dataset.append(ranking_data)
 
         return ranking_dataset
-
-
-    train_joint = False
-    if train_joint:
-        best_joint_val = float("inf")
-        joint_bad_checks = 0
-        for i in range(0, 200):
-            enc.train()
-            dec.train()
-            for graph in train_data:
-                optimizer_joint.zero_grad(set_to_none=True)
-
-                edge_attr = graph.edge_attr.float()
-                if edge_attr.ndim == 1:
-                    edge_attr = edge_attr.unsqueeze(-1)
-
-                out = enc(
-                    x=graph.x.float(),
-                    edge_index=graph.edge_index,
-                    edge_attr=edge_attr,
-                )
-                loss_enc, metrics = encoder_loss(
-                    out=out,
-                    batch=graph,
-                )
-
-                edge_logits = dec(build_decoder_input(out))
-
-
-                ranks = preference_lists_to_edge_ranks(
-                    graph.proposee_pref | graph.proposer_pref, graph.edge_index
-                )
-                criterion_eval = BlockingPairLoss(
-                    edge_index=graph.edge_index,
-                    edge_ranks=ranks,
-                    num_nodes=graph.num_nodes,
-                    degree_weight=1.0,
-                    temperature=0.01,
-                    reduction="mean",
-                )
-                loss_dec_eval, parts_ = criterion_eval(edge_logits)
-                loss_joint = loss_enc*0.5  + loss_dec_eval*0.5
-
-                loss_joint.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(enc.parameters()) + list(dec.parameters()),
-                    max_norm=1.0,
-                )
-                optimizer_joint.step()
-
-            val_joint = eval_joint_loss(val_data)
-            print("Joint epoch: " + str(i) + " | val loss: " + str(val_joint))
-
-            if val_joint < best_joint_val - min_delta:
-                best_joint_val = val_joint
-                joint_bad_checks = 0
-                torch.save(enc.state_dict(), "enc.pt")
-                torch.save(dec.state_dict(), "dec.pt")
-            else:
-                joint_bad_checks += 1
-                if joint_bad_checks >= joint_patience:
-                    print("Joint early stopping at epoch " + str(i))
-                    break
 
 
     optimizer_joint = torch.optim.AdamW(
@@ -1684,6 +2309,7 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
         left_nodes,
         right_nodes,
         roommate=roommate,
+        mixed=mixed,
     )
 
     val_ranking = prepare_dataset_ranking(
@@ -1691,6 +2317,7 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
         left_nodes,
         right_nodes,
         roommate=roommate,
+        mixed=mixed,
     )
 
     encoder_weight = 0.2
@@ -1739,9 +2366,9 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
     best_ranking_val = float("inf")
     ranking_bad_checks = 0
     best_ranking_epoch = -1
-    trainjoint=False
-    if trainjoint:
-        for epoch in range(5):
+
+    if training:
+        for epoch in range(10):
             enc.train()
             dec.train()
 
@@ -1809,17 +2436,75 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
                 f"train_rank={total_rank_loss / count:.6f}"
             )
 
+        # A tanítási epochok után elmentjük az encoder és decoder
+        # súlyait, hogy később visszatölthetők legyenek.
+        torch.save(enc.state_dict(), "enc.pt")
+        torch.save(dec.state_dict(), "dec.pt")
+        print("Encoder és decoder modellek elmentve: enc.pt, dec.pt")
+
 
 
     # A legjobb (early-stopped) közös súlyok visszatöltése az értékeléshez.
-    enc.load_state_dict(torch.load("enc.pt", weights_only=True))
-    dec.load_state_dict(torch.load("dec.pt", weights_only=True))
+    if not training:
+        enc.load_state_dict(torch.load("enc.pt", weights_only=True))
+        dec.load_state_dict(torch.load("dec.pt", weights_only=True))
     counts = []
     good = 0
     bad = 0
+
+    # Típusonkénti (szobatárs vs. házassági) számlálás és pontosság.
+    # good = stabil párosítás (nincs blokkoló pár), bad = instabil.
+    roommate_good = 0
+    roommate_bad = 0
+    marriage_good = 0
+    marriage_bad = 0
+
+    # Méret szerinti bontás. Kulcs: (típus, agent_count), érték:
+    # [stabil, összes]. A "méret" a résztvevők (agent) száma:
+    #   - házasság (marriage): num_nodes // 2 fő oldalanként,
+    #   - szobatárs (roommate): num_nodes fő összesen.
+    # Így per-méret látható, hogy a modell mekkora problémákon mennyire
+    # pontos (stabilitási arány).
+    size_stats = defaultdict(lambda: [0, 0])      # (type, size) -> [stable, total]
+    size_stats_overall = defaultdict(lambda: [0, 0])  # size -> [stable, total]
+
+    # Szobatárs (roommate) gráfok, amelyeknek NINCS stabil megoldása
+    # (Irving algoritmusa szerint), kimaradnak a kiértékelésből, mert
+    # ilyenkor a modelltől sem várható stabil párosítás. Külön számláljuk,
+    # hogy látható legyen, hány gráfot hagytunk ki emiatt.
+    roommate_skipped_no_stable = 0
+
     for graph in val_data:
         enc.eval()
         dec.eval()
+
+        graph_is_roommate = is_roommate_graph(graph)
+
+        # Szobatárs esetben előzetesen ellenőrizzük Irving algoritmusával,
+        # hogy létezik-e egyáltalán stabil párosítás. Ha nem, kihagyjuk a
+        # gráfot (nem számít bele egyik metrikába sem).
+        if graph_is_roommate:
+            preferences = graph.proposee_pref | graph.proposer_pref
+
+            # Kölcsönösen elfogadható (mindkét irányban létező él)
+            # kanonikus (min,max) párok halmaza.
+            directed = set(
+                (int(u), int(v))
+                for u, v in graph.edge_index.t().tolist()
+            )
+            allowed_pairs = set()
+            for (u, v) in directed:
+                if (v, u) in directed:
+                    allowed_pairs.add((min(u, v), max(u, v)))
+
+            nodes = list(range(int(graph.num_nodes)))
+            stable = _irving_stable_roommate(
+                nodes, preferences, allowed_pairs
+            )
+            if stable is None:
+                roommate_skipped_no_stable += 1
+                continue
+
         out = enc(
             x=graph.x,
             edge_index=graph.edge_index,
@@ -1851,48 +2536,139 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
         )
         counts.append(len(blocking_pairs))
 
-        # Olvasható párosítás: kanonikus (u, v) párok u < v szerint,
-        # plusz a párosítatlan node-ok külön.
-        partner_list = partner.detach().cpu().tolist()
-        matched_pairs = sorted(
-            {
-                (min(u, v), max(u, v))
-                for u, v in enumerate(partner_list)
-                if v != -1
-            }
-        )
-        unmatched = [
-            u for u, v in enumerate(partner_list) if v == -1
-        ]
+        is_stable = len(blocking_pairs) == 0
 
-        print("Párosítás (matching pairs):", matched_pairs)
-        if unmatched:
-            print("Párosítatlan node-ok:", unmatched)
-
-        if blocking_pairs:
-            print(
-                f"Blokkoló párok ({len(blocking_pairs)}):",
-                sorted(blocking_pairs),
-            )
-        else:
-            print("Blokkoló párok: nincs (stabil párosítás)")
-
-        if len(blocking_pairs)==0:
-            good+=1
+        if is_stable:
+            good += 1
         else:
             bad += 1
+
+        if graph_is_roommate:
+            if is_stable:
+                roommate_good += 1
+            else:
+                roommate_bad += 1
+        else:
+            if is_stable:
+                marriage_good += 1
+            else:
+                marriage_bad += 1
+
+        # Méret szerinti akkumuláció.
+        #   - Típusonként a "size" a résztvevők (agent) száma a típus
+        #     természetes egységében: házasságnál az oldalankénti létszám
+        #     (num_nodes // 2), szobatársnál a teljes létszám (num_nodes).
+        #   - Az ÖSSZESÍTETT bontás a node-számot (num_nodes) használja
+        #     kulcsként, hogy a két típus mérete egyértelmű, közös skálán
+        #     legyen összehasonlítható.
+        num_nodes = int(graph.num_nodes)
+        if graph_is_roommate:
+            size = num_nodes
+            type_name = "roommate"
+        else:
+            size = num_nodes // 2
+            type_name = "marriage"
+
+        size_stats[(type_name, size)][1] += 1
+        size_stats_overall[num_nodes][1] += 1
+        if is_stable:
+            size_stats[(type_name, size)][0] += 1
+            size_stats_overall[num_nodes][0] += 1
+
     print("Blocking-count eloszlás:", dict(sorted(Counter(counts).items())))
-    print("Átlag:", sum(counts) / len(counts))
-    print("Stabilitási arány:",
-          sum(c == 0 for c in counts) / len(counts))
-    print(good/(good+bad))
+    if counts:
+        print("Átlag:", sum(counts) / len(counts))
+        print("Stabilitási arány:",
+              sum(c == 0 for c in counts) / len(counts))
+    else:
+        print("Nincs kiértékelhető gráf (minden gráf kihagyva).")
+    if good + bad > 0:
+        print(good/(good+bad))
+
+    # Típusonkénti bontás: hány szobatárs / házassági problémát néztünk,
+    # és mekkora volt a stabilitási arány (pontosság) külön-külön.
+    roommate_total = roommate_good + roommate_bad
+    marriage_total = marriage_good + marriage_bad
+
+    # Hány szobatárs gráfnak NINCS egyáltalán stabil megoldása (Irving),
+    # ezeket kihagytuk a kiértékelésből.
+    roommate_seen = roommate_total + roommate_skipped_no_stable
+    print("--- Megoldhatóság (szobatárs) ---")
+    print(
+        f"Szobatárs gráfok összesen (val): {roommate_seen}"
+    )
+    print(
+        f"  Nincs stabil megoldás (Irving szerint), kihagyva: "
+        f"{roommate_skipped_no_stable}"
+    )
+    if roommate_seen > 0:
+        print(
+            f"  Megoldhatatlan arány: "
+            f"{roommate_skipped_no_stable / roommate_seen:.4f}"
+        )
+    print(
+        f"  Kiértékelésbe bekerült (van stabil megoldás): "
+        f"{roommate_total}"
+    )
+
+    print("--- Típusonkénti kiértékelés ---")
+    print(f"Szobatárs (roommate) problémák: {roommate_total}")
+    if roommate_total > 0:
+        print(
+            f"  Szobatárs stabilitási arány: "
+            f"{roommate_good / roommate_total:.4f} "
+            f"({roommate_good}/{roommate_total})"
+        )
+    print(f"Házassági (marriage) problémák: {marriage_total}")
+    if marriage_total > 0:
+        print(
+            f"  Házassági stabilitási arány: "
+            f"{marriage_good / marriage_total:.4f} "
+            f"({marriage_good}/{marriage_total})"
+        )
+
+    # --- Méret szerinti kiértékelés ---
+    # Megmutatja, hogy a modell mekkora problémákon mennyire pontos.
+    #   - Az ÖSSZESÍTETT bontás kulcsa a node-szám (num_nodes), ez közös,
+    #     egyértelmű skála mindkét típusra.
+    #   - A típusonkénti bontásnál a "size" a résztvevők természetes
+    #     létszáma: házasságnál oldalanként (num_nodes/2), szobatársnál a
+    #     teljes létszám (num_nodes).
+    print("--- Méret szerinti kiértékelés (stabilitási arány) ---")
+
+    print("Összesített, node-szám szerint (típustól függetlenül):")
+    for n_nodes in sorted(size_stats_overall):
+        stable, total = size_stats_overall[n_nodes]
+        if total > 0:
+            print(
+                f"  node={n_nodes:>3}: {stable / total:.4f} "
+                f"({stable}/{total})"
+            )
+
+    for type_name, type_label, unit in (
+        ("marriage", "Házassági (marriage)", "oldalankénti létszám"),
+        ("roommate", "Szobatárs (roommate)", "teljes létszám"),
+    ):
+        sizes = sorted(s for (t, s) in size_stats if t == type_name)
+        if not sizes:
+            continue
+        print(f"{type_label} méret szerint ({unit}):")
+        for size in sizes:
+            stable, total = size_stats[(type_name, size)]
+            if total > 0:
+                print(
+                    f"  méret={size:>3}: {stable / total:.4f} "
+                    f"({stable}/{total})"
+                )
+
     print("finished")
 
     # A teljes-matching rangsoroló kiértékelés (rank_all_complete_matchings)
     # kizárólag páros gráfokra készült (left/right oldal). Szobatárs esetben
     # a fenti blocking-count alapú kiértékelés adja a stabilitási metrikát,
-    # így itt kilépünk.
-    if roommate:
+    # így itt kilépünk. Kevert adathalmaznál is kilépünk, mert a lenti rész
+    # fix left/right felosztást feltételez, ami szobatárs-gráfokra érvénytelen.
+    if roommate or mixed:
         return
 
     enc.eval()
@@ -2052,10 +2828,7 @@ def main(training=False,roommate =  True,LLM_FILE_GEN = False,LLM_TEST = False,G
 
 
 if __name__ == "__main__":
-    training = False
-    roommate = False
-    LLM_FILE_GEN = False
-    LLM_TEST = False
-    GAT_TEST = False
-    LOCAL_LLM = False
-    main(training, roommate,LLM_FILE_GEN,LLM_TEST,GAT_TEST,LOCAL_LLM)
+    training = True
+    roommate = True
+    mixed = False
+    main(training, roommate, mixed)
