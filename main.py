@@ -14,6 +14,12 @@ from typing import Dict
 from typing import List, Tuple
 import random
 
+# A preferencia-reprezentáció verziója. A szobatárs (roommate) gráfok
+# mostantól HOLTVERSENYES (réteges) preferenciákat használnak, ezért a
+# régi (holtverseny nélküli) cache-eket érvénytelenítjük ezzel a kulccsal.
+PREF_FORMAT_VERSION = "roommate_ties_v1"
+
+
 def best_pairing_for_selected_node(
     selected_nodes,
     edge_index,
@@ -353,25 +359,39 @@ def _irving_stable_roommate(nodes, prefs, allowed_pairs):
     """
     Irving algoritmusa a stabil szobatárs-problémára.
 
-    `prefs[x]` x preferencialistája (legjobb elöl). Csak az allowed_pairs-
-    beli (kölcsönösen elfogadható) jelölteket vesszük figyelembe.
+    `prefs[x]` x preferencialistája (legjobb elöl). Lehet SIMA lista vagy
+    RÉTEGELT / holtversenyes (listák listája) formátum. Holtverseny esetén
+    a rétegeket tetszőleges, de rögzített sorrendben "szigorúsítjuk"
+    (tie-break), majd a klasszikus (szigorú preferenciákat feltételező)
+    Irving-algoritmust futtatjuk. Egy tetszőleges tie-break szerinti
+    stabil párosítás az eredeti (holtversenyes) instanciában GYENGÉN
+    stabil, így ez korrekt (bár nem teljes) megoldhatósági próba a gyenge
+    stabilitásra.
 
-    Visszatér: kanonikus párlista, ha létezik stabil párosítás; egyébként
-    None.
+    Csak az allowed_pairs-beli (kölcsönösen elfogadható) jelölteket
+    vesszük figyelembe.
+
+    Visszatér: kanonikus párlista, ha a tie-break szerint létezik stabil
+    párosítás; egyébként None.
 
     Megvalósítás a klasszikus két fázis szerint:
       1. fázis: javaslatok (proposal), amíg mindenki tart egy ajánlatot.
       2. fázis: rotációk kiküszöbölése (rotation elimination).
-
-    A preferencialistákat szűkített alakban (`pref_list`) tartjuk; a lista
-    pozíciói helyett mindig az aktuális listában keresünk.
     """
     def pair_ok(a, b):
         return (min(a, b), max(a, b)) in allowed_pairs
 
+    # Réteges (holtversenyes) preferenciát sima listává lapítunk
+    # (tie-break): a réteg indexe szerint, azon belül a megadott
+    # sorrendben. Így a szigorú Irving futtatható.
+    flat_prefs = {
+        x: data_generator._flatten_tiers(prefs.get(x, []))
+        for x in nodes
+    }
+
     # Szűrt preferencialisták (sorrend megtartva, kölcsönös párok).
     pref_list = {
-        x: [y for y in prefs.get(x, []) if y != x and pair_ok(x, y)]
+        x: [y for y in flat_prefs.get(x, []) if y != x and pair_ok(x, y)]
         for x in nodes
     }
 
@@ -1188,18 +1208,22 @@ def preference_lists_to_edge_ranks(
     """
     Preferencialistákból [E] rank tensor.
 
-    preferences[u] = [legjobb, ..., legrosszabb]
+    Két formátumot kezel:
+      - SIMA (házassági): preferences[u] = [legjobb, ..., legrosszabb];
+        minden partner KÜLÖN rangot kap (az index).
+      - RÉTEGELT / holtversenyes (szobatárs): preferences[u] =
+        [[legjobb réteg], ..., [legrosszabb réteg]]; egy réteg minden
+        tagja AZONOS rangot kap (a réteg indexét) -> holtverseny.
+
+    A formátumot per-node automatikusan felismeri (`_is_tiered`): ha az
+    első elem lista, réteges, különben sima. Így a házassági útvonal
+    változatlan marad, a szobatárs út pedig a holtversenyes ranggal fut.
 
     output[e] = rankja annak a partnernek, amelyhez
-    edge_index[:, e] = [u, v] tartozik.
-
-    0 = legjobb partner.
+    edge_index[:, e] = [u, v] tartozik. 0 = legjobb partner.
     """
     rank_dict = {
-        u: {
-            v: rank
-            for rank, v in enumerate(pref_list)
-        }
+        u: data_generator._tier_rank_of(pref_list)
         for u, pref_list in preferences.items()
     }
 
@@ -1909,6 +1933,119 @@ def find_blocking_pairs(
 
     return blocking_pairs
 
+
+def classify_stability_level(
+    edge_index: torch.Tensor,
+    edge_ranks: torch.Tensor,
+    partner: torch.Tensor,
+) -> str:
+    """
+    Egy párosítás LEGERŐSEBB teljesülő SRT (holtversenyes) stabilitási
+    szintjét adja vissza: "super", "strong", "weak" vagy "unstable".
+
+    A rangok (edge_ranks) a `preference_lists_to_edge_ranks` kimenete,
+    ahol a holtversenyben lévő partnerek AZONOS rangot kapnak. Kisebb rang
+    = jobb partner. A párt csak kölcsönös elfogadhatóság esetén nézzük
+    (u->v és v->u is létezik).
+
+    Egy (u,v) pár (nem egymás párja) blokkolása a három definíció szerint:
+      - super : MINDKÉT fél GYENGÉN (<=) preferálja a másikat a jelenlegi
+                partneréhez képest (azaz legalább annyira szereti).
+      - strong: az egyik fél SZIGORÚAN (<), a másik GYENGÉN (<=) preferál.
+      - weak  : MINDKÉT fél SZIGORÚAN (<) preferál.
+
+    Egy párosítás:
+      - super-stabil, ha nincs super-blokkoló pár,
+      - strong-stabil, ha nincs strong-blokkoló pár,
+      - weak-stabil, ha nincs weak-blokkoló pár.
+    A hierarchia: super => strong => weak. A visszaadott szint a
+    legerősebb, amelyet a párosítás teljesít; ha a weak sem teljesül,
+    "unstable".
+    """
+    if edge_ranks.ndim == 2:
+        rvals = edge_ranks[:, 0]
+    elif edge_ranks.ndim == 1:
+        rvals = edge_ranks
+    else:
+        raise ValueError(
+            f"edge_ranks shape-ja [E] vagy [E,F] legyen, "
+            f"de ez: {tuple(edge_ranks.shape)}"
+        )
+
+    src = edge_index[0].detach().cpu().tolist()
+    dst = edge_index[1].detach().cpu().tolist()
+    rvals = rvals.detach().cpu().tolist()
+    partner = partner.detach().cpu().tolist()
+
+    # rank_of[u][v] = u milyen rangra teszi v-t (kisebb = jobb).
+    rank_of = {}
+    for u, v, r in zip(src, dst, rvals):
+        rank_of.setdefault(u, {})[v] = float(r)
+
+    def rank_to_partner(agent: int) -> float:
+        """Az agent jelenlegi partnerének rangja; unmatched/ismeretlen = +inf
+        (azaz bárki elfogadható partner jobb nála)."""
+        cur = partner[agent]
+        if cur == -1:
+            return float("inf")
+        return rank_of.get(agent, {}).get(cur, float("inf"))
+
+    # A legenyhébb (super) definíció sérülése a "legrosszabb" eset.
+    # Egyszerre követjük, hogy van-e super- és strong-blokkoló pár.
+    has_super_block = False
+    has_strong_block = False
+    has_weak_block = False
+
+    for u, neighbors in rank_of.items():
+        cur_u = rank_to_partner(u)
+        for v, r_uv in neighbors.items():
+            if u == v:
+                continue
+            # Kölcsönös elfogadhatóság.
+            if u not in rank_of.get(v, {}):
+                continue
+            # Egymás párja: nem blokkol.
+            if partner[u] == v:
+                continue
+            # Csak egy irányból dolgozzuk fel a kanonikus párt.
+            if u > v:
+                continue
+
+            r_vu = rank_of[v][u]
+            cur_v = rank_to_partner(v)
+
+            # u (ill. v) viszonya a jelenlegi partneréhez.
+            u_strict = r_uv < cur_u
+            u_weak = r_uv <= cur_u
+            v_strict = r_vu < cur_v
+            v_weak = r_vu <= cur_v
+
+            # super-blokk: mindkettő gyengén preferál.
+            if u_weak and v_weak:
+                has_super_block = True
+            # strong-blokk: egyik szigorú, másik gyenge.
+            if (u_strict and v_weak) or (u_weak and v_strict):
+                has_strong_block = True
+            # weak-blokk: mindkettő szigorú.
+            if u_strict and v_strict:
+                has_weak_block = True
+
+            # Ha már weak-blokk is van, erősebbet nem tudunk teljesíteni.
+            if has_weak_block:
+                # Nem lépünk ki azonnal: a hierarchia miatt a weak-blokk
+                # jelenléte eldönti a végeredményt (unstable), de a
+                # super/strong flagek már True-k lennének, így korrekt.
+                pass
+
+    if not has_super_block:
+        return "super"
+    if not has_strong_block:
+        return "strong"
+    if not has_weak_block:
+        return "weak"
+    return "unstable"
+
+
 def get_or_generate_dataset(
     group_size,
     gen_fn,
@@ -1918,6 +2055,7 @@ def get_or_generate_dataset(
     seed=None,
     graph_fn=None,
     group_sizes=None,
+    allow_ties=False,
 ):
     """
     Betölti a train/val adathalmazt lemezről, ha van cache; különben
@@ -1955,6 +2093,8 @@ def get_or_generate_dataset(
             and blob.get("group_sizes") == group_sizes
             and blob.get("gen_name") == gen_name
             and blob.get("graph_name") == graph_name
+            and blob.get("pref_format") == PREF_FORMAT_VERSION
+            and blob.get("allow_ties") == allow_ties
             and len(blob["train_data"]) == n_train
             and len(blob["val_data"]) == n_val
         ):
@@ -1974,7 +2114,13 @@ def get_or_generate_dataset(
 
     def make_sample():
         gs = pick_size()
-        return gen_fn(graph_fn(gs), gs)
+        G = graph_fn(gs)
+        # A szobatárs (roommate) konverter támogatja a holtversenyt
+        # (allow_ties); a páros (marriage) konverter nem, ezért oda nem
+        # adjuk át a paramétert.
+        if gen_fn is data_generator.graph_to_pyg_data_r_normal:
+            return gen_fn(G, gs, allow_ties=allow_ties)
+        return gen_fn(G, gs)
 
     train_data = [make_sample() for _ in range(n_train)]
     val_data = [make_sample() for _ in range(n_val)]
@@ -1987,6 +2133,8 @@ def get_or_generate_dataset(
             "group_sizes": group_sizes,
             "gen_name": gen_name,
             "graph_name": graph_name,
+            "pref_format": PREF_FORMAT_VERSION,
+            "allow_ties": allow_ties,
         },
         cache_path,
     )
@@ -2000,6 +2148,7 @@ def get_or_generate_mixed_dataset(
     n_val=500,
     cache_path="dataset_mixed.pt",
     seed=None,
+    allow_ties=False,
 ):
     """
     50/50 arányban kevert train/val adathalmazt készít szobatárs
@@ -2032,6 +2181,8 @@ def get_or_generate_mixed_dataset(
             blob.get("group_size") == group_size
             and blob.get("gen_name") == gen_name
             and blob.get("graph_name") == graph_name
+            and blob.get("pref_format") == PREF_FORMAT_VERSION
+            and blob.get("allow_ties") == allow_ties
             and len(blob["train_data"]) == n_train
             and len(blob["val_data"]) == n_val
         ):
@@ -2070,7 +2221,7 @@ def get_or_generate_mixed_dataset(
             G = data_generator.generate_graph_r(r_nodes)
             samples.append(
                 data_generator.graph_to_pyg_data_r_normal(
-                    G, r_nodes
+                    G, r_nodes, allow_ties=allow_ties
                 )
             )
 
@@ -2100,6 +2251,8 @@ def get_or_generate_mixed_dataset(
             "group_size": group_size,
             "gen_name": gen_name,
             "graph_name": graph_name,
+            "pref_format": PREF_FORMAT_VERSION,
+            "allow_ties": allow_ties,
         },
         cache_path,
     )
@@ -2107,7 +2260,7 @@ def get_or_generate_mixed_dataset(
     return train_data, val_data
 
 
-def main(training=False, roommate=True, mixed=False):
+def main(training=False, roommate=True, mixed=False, allow_ties=False):
 
     group_size=3
 
@@ -2122,6 +2275,7 @@ def main(training=False, roommate=True, mixed=False):
             n_val=500,
             cache_path="dataset_mixed.pt",
             seed=42,
+            allow_ties=allow_ties,
         )
     elif roommate:
         # Stabil szobatárs (roommate) eset: nem-páros bázisgráf
@@ -2145,6 +2299,7 @@ def main(training=False, roommate=True, mixed=False):
             cache_path="dataset_roommate.pt",
             seed=42,
             group_sizes=[2 * gs for gs in (3, 4, 5, 6)],
+            allow_ties=allow_ties,
         )
     else:
         # Páros (bipartite) eset: generate_graph_m bázisgráf.
@@ -2468,42 +2623,27 @@ def main(training=False, roommate=True, mixed=False):
     size_stats = defaultdict(lambda: [0, 0])      # (type, size) -> [stable, total]
     size_stats_overall = defaultdict(lambda: [0, 0])  # size -> [stable, total]
 
-    # Szobatárs (roommate) gráfok, amelyeknek NINCS stabil megoldása
-    # (Irving algoritmusa szerint), kimaradnak a kiértékelésből, mert
-    # ilyenkor a modelltől sem várható stabil párosítás. Külön számláljuk,
-    # hogy látható legyen, hány gráfot hagytunk ki emiatt.
-    roommate_skipped_no_stable = 0
+    # Stabilitási szintek szerinti számlálás (SRT holtversenyes esetben).
+    # Minden kiértékelt párosítást a LEGERŐSEBB teljesülő szint szerint
+    # sorolunk be: super > strong > weak > unstable (a hierarchia miatt a
+    # super egyben strong és weak is, stb.). Kulcs: típus -> szint -> db,
+    # plusz egy összesített (overall) számláló.
+    stability_levels = ["super", "strong", "weak", "unstable"]
+    stability_stats = {
+        "overall": {lvl: 0 for lvl in stability_levels},
+        "roommate": {lvl: 0 for lvl in stability_levels},
+        "marriage": {lvl: 0 for lvl in stability_levels},
+    }
+    # Méret szerinti stabilitási szint bontás: (típus, size) -> {szint: db}.
+    stability_by_size = defaultdict(
+        lambda: {lvl: 0 for lvl in stability_levels}
+    )
 
     for graph in val_data:
         enc.eval()
         dec.eval()
 
         graph_is_roommate = is_roommate_graph(graph)
-
-        # Szobatárs esetben előzetesen ellenőrizzük Irving algoritmusával,
-        # hogy létezik-e egyáltalán stabil párosítás. Ha nem, kihagyjuk a
-        # gráfot (nem számít bele egyik metrikába sem).
-        if graph_is_roommate:
-            preferences = graph.proposee_pref | graph.proposer_pref
-
-            # Kölcsönösen elfogadható (mindkét irányban létező él)
-            # kanonikus (min,max) párok halmaza.
-            directed = set(
-                (int(u), int(v))
-                for u, v in graph.edge_index.t().tolist()
-            )
-            allowed_pairs = set()
-            for (u, v) in directed:
-                if (v, u) in directed:
-                    allowed_pairs.add((min(u, v), max(u, v)))
-
-            nodes = list(range(int(graph.num_nodes)))
-            stable = _irving_stable_roommate(
-                nodes, preferences, allowed_pairs
-            )
-            if stable is None:
-                roommate_skipped_no_stable += 1
-                continue
 
         out = enc(
             x=graph.x,
@@ -2536,7 +2676,16 @@ def main(training=False, roommate=True, mixed=False):
         )
         counts.append(len(blocking_pairs))
 
-        is_stable = len(blocking_pairs) == 0
+        # A párosítás legerősebb teljesülő stabilitási szintje
+        # (super > strong > weak > unstable) az SRT holtversenyes
+        # definíciók szerint. A "weak" megegyezik azzal, hogy nincs
+        # (gyenge) blokkoló pár, azaz is_stable igaz.
+        level = classify_stability_level(
+            edge_index=graph.edge_index,
+            edge_ranks=ranks,
+            partner=partner,
+        )
+        is_stable = level != "unstable"  # = gyengén stabil (nincs weak-blokk)
 
         if is_stable:
             good += 1
@@ -2575,6 +2724,11 @@ def main(training=False, roommate=True, mixed=False):
             size_stats[(type_name, size)][0] += 1
             size_stats_overall[num_nodes][0] += 1
 
+        # Stabilitási szint szerinti számlálás.
+        stability_stats["overall"][level] += 1
+        stability_stats[type_name][level] += 1
+        stability_by_size[(type_name, size)][level] += 1
+
     print("Blocking-count eloszlás:", dict(sorted(Counter(counts).items())))
     if counts:
         print("Átlag:", sum(counts) / len(counts))
@@ -2590,26 +2744,51 @@ def main(training=False, roommate=True, mixed=False):
     roommate_total = roommate_good + roommate_bad
     marriage_total = marriage_good + marriage_bad
 
-    # Hány szobatárs gráfnak NINCS egyáltalán stabil megoldása (Irving),
-    # ezeket kihagytuk a kiértékelésből.
-    roommate_seen = roommate_total + roommate_skipped_no_stable
-    print("--- Megoldhatóság (szobatárs) ---")
-    print(
-        f"Szobatárs gráfok összesen (val): {roommate_seen}"
-    )
-    print(
-        f"  Nincs stabil megoldás (Irving szerint), kihagyva: "
-        f"{roommate_skipped_no_stable}"
-    )
-    if roommate_seen > 0:
+    # --- Stabilitási szintek (SRT holtversenyes) ---
+    # Minden kiértékelt párosítást a LEGERŐSEBB teljesülő szintje szerint
+    # soroltunk be (super > strong > weak > unstable). A hierarchia miatt:
+    #   super-stabil arány  = super
+    #   strong-stabil arány = super + strong
+    #   weak-stabil arány   = super + strong + weak
+    # (azaz a magasabb szint mindig teljesíti az alacsonyabbat is).
+    def print_stability_block(label, levels_counts):
+        total = sum(levels_counts.values())
+        print(f"{label} (összes: {total})")
+        if total == 0:
+            return
+        n_super = levels_counts["super"]
+        n_strong = levels_counts["strong"]
+        n_weak = levels_counts["weak"]
+        n_unstable = levels_counts["unstable"]
+        # Kumulatív (hierarchikus) arányok.
+        super_ratio = n_super / total
+        strong_ratio = (n_super + n_strong) / total
+        weak_ratio = (n_super + n_strong + n_weak) / total
         print(
-            f"  Megoldhatatlan arány: "
-            f"{roommate_skipped_no_stable / roommate_seen:.4f}"
+            f"  super : {super_ratio:.4f} ({n_super}/{total})"
         )
-    print(
-        f"  Kiértékelésbe bekerült (van stabil megoldás): "
-        f"{roommate_total}"
-    )
+        print(
+            f"  strong: {strong_ratio:.4f} "
+            f"({n_super + n_strong}/{total})  [super+strong]"
+        )
+        print(
+            f"  weak  : {weak_ratio:.4f} "
+            f"({n_super + n_strong + n_weak}/{total})  [super+strong+weak]"
+        )
+        print(
+            f"  instabil (egyik szint sem): "
+            f"{n_unstable / total:.4f} ({n_unstable}/{total})"
+        )
+        # Nyers, egymást kizáró szint-eloszlás is.
+        print(
+            f"  nyers eloszlás: super={n_super}, strong={n_strong}, "
+            f"weak={n_weak}, unstable={n_unstable}"
+        )
+
+    print("--- Stabilitási szintek (super / strong / weak) ---")
+    print_stability_block("Összesített", stability_stats["overall"])
+    print_stability_block("Szobatárs (roommate)", stability_stats["roommate"])
+    print_stability_block("Házassági (marriage)", stability_stats["marriage"])
 
     print("--- Típusonkénti kiértékelés ---")
     print(f"Szobatárs (roommate) problémák: {roommate_total}")
@@ -2661,6 +2840,37 @@ def main(training=False, roommate=True, mixed=False):
                     f"({stable}/{total})"
                 )
 
+    # --- Stabilitási szintek méret szerint ---
+    # Kumulatív arányok (super <= strong <= weak) méretenként, hogy
+    # látható legyen, a nagyobb problémákon melyik szint mennyire tartható.
+    print("--- Stabilitási szintek méret szerint (kumulatív arányok) ---")
+    for type_name, type_label, unit in (
+        ("marriage", "Házassági (marriage)", "oldalankénti létszám"),
+        ("roommate", "Szobatárs (roommate)", "teljes létszám"),
+    ):
+        sizes = sorted(
+            s for (t, s) in stability_by_size if t == type_name
+        )
+        if not sizes:
+            continue
+        print(f"{type_label} ({unit}):")
+        for size in sizes:
+            lc = stability_by_size[(type_name, size)]
+            total = sum(lc.values())
+            if total == 0:
+                continue
+            n_super = lc["super"]
+            n_strong = lc["strong"]
+            n_weak = lc["weak"]
+            super_r = n_super / total
+            strong_r = (n_super + n_strong) / total
+            weak_r = (n_super + n_strong + n_weak) / total
+            print(
+                f"  méret={size:>3} (n={total}): "
+                f"super={super_r:.3f} | strong={strong_r:.3f} | "
+                f"weak={weak_r:.3f}"
+            )
+    print(val_data[0].prefs)
     print("finished")
 
     # A teljes-matching rangsoroló kiértékelés (rank_all_complete_matchings)
@@ -2828,7 +3038,11 @@ def main(training=False, roommate=True, mixed=False):
 
 
 if __name__ == "__main__":
-    training = True
+    training = False
     roommate = True
     mixed = False
-    main(training, roommate, mixed)
+    # Holtverseny (ties) a szobatárs preferenciákban. False = a régi,
+    # holtverseny nélküli adattal fut (csak a reprezentáció réteges),
+    # True = valódi holtversenyes preferenciák.
+    allow_ties = True
+    main(training, roommate, mixed, allow_ties)

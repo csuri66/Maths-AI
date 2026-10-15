@@ -309,7 +309,94 @@ def _ranking_from_scores(candidates, scores):
     return [candidates[i] for i in order]
 
 
-def graph_to_pyg_data_r_normal(G, group_size):
+def _tiered_ranking_from_scores(candidates, scores, bucket=0.6):
+    """Preferencia-RÉTEGEKET (tiers) állít elő a pontszámokból, HOLTVERSENYEKKEL.
+
+    A szobatárs (roommate) esetben megengedjük, hogy több partner AZONOS
+    rangot kapjon (holtverseny). A megvalósítás: a pontszámokat `bucket`
+    felbontással diszkretizáljuk (kvantáljuk), majd az azonos kvantált
+    értékű jelöltek egy közös rétegbe (tier) kerülnek. A rétegeket a
+    kvantált érték szerint rendezzük (növekvő = jobb elöl), így a kimenet
+    rétegek listája:
+
+        [[legjobb réteg tagjai], ..., [legrosszabb réteg tagjai]]
+
+    Egy réteg (tier) minden tagja azonos rangú (holtverseny).
+
+    `candidates` és `scores` azonos hosszúságú listák. `bucket` szabályozza
+    a holtversenyek gyakoriságát: nagyobb érték -> több holtverseny.
+    """
+    # Kvantált kulcs: azonos kulcsú jelöltek holtversenyben vannak.
+    keyed = [
+        (round(scores[i] / bucket), candidates[i])
+        for i in range(len(candidates))
+    ]
+    # Rendezés a kvantált kulcs szerint (növekvő = jobb elöl).
+    keyed.sort(key=lambda kc: kc[0])
+
+    tiers = []
+    current_key = None
+    for key, cand in keyed:
+        if key != current_key:
+            tiers.append([cand])
+            current_key = key
+        else:
+            tiers[-1].append(cand)
+    return tiers
+
+
+def _strict_tiers_from_scores(candidates, scores):
+    """Réteges formátumú, de HOLTVERSENY NÉLKÜLI preferencia a pontszámokból.
+
+    Minden jelölt a SAJÁT egyelemű rétegébe (tier) kerül, a pontszám
+    szerinti (növekvő = jobb) sorrendben. Így az eredmény ugyanabban a
+    réteges reprezentációban van, mint `_tiered_ranking_from_scores`, de
+    numerikusan megegyezik a régi, szigorú (holtverseny nélküli) adattal:
+
+        [[legjobb], [második], ..., [legrosszabb]]
+    """
+    flat = _ranking_from_scores(candidates, scores)
+    return [[c] for c in flat]
+
+
+def _is_tiered(pref_list):
+    """True, ha a preferencialista RÉTEGELT (tiers = listák listája).
+
+    A réteges (szobatárs, holtversenyes) formátumban az első elem maga is
+    lista. A sima (házassági) formátumban az elemek node-id-k (int).
+    """
+    return len(pref_list) > 0 and isinstance(pref_list[0], (list, tuple))
+
+
+def _tier_rank_of(pref_list):
+    """{partner_id: tier_index} leképezés egy (réteges VAGY sima) listából.
+
+    Réteges formátumnál egy réteg minden tagja AZONOS rangot (a réteg
+    indexét) kapja -> holtverseny. Sima listánál a rang az elem indexe
+    (minden partner külön rangot kap).
+    """
+    rank_of = {}
+    if _is_tiered(pref_list):
+        for tier_idx, tier in enumerate(pref_list):
+            for member in tier:
+                rank_of[member] = tier_idx
+    else:
+        for idx, member in enumerate(pref_list):
+            rank_of[member] = idx
+    return rank_of
+
+
+def _flatten_tiers(pref_list):
+    """Réteges listát sima (best->worst) listává lapít; sima listát változatlanul ad."""
+    if _is_tiered(pref_list):
+        flat = []
+        for tier in pref_list:
+            flat.extend(tier)
+        return flat
+    return list(pref_list)
+
+
+def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False):
     """
     A `graph_to_pyg_data_normal` stabil-szobatárs (roommate) változata.
 
@@ -318,6 +405,12 @@ def graph_to_pyg_data_r_normal(G, group_size):
     rangsorolva állítja elő (mint a `graph_to_pyg_data_normal` a páros
     esetben), de olyan `Data` objektumot ad vissza, amely KOMPATIBILIS a
     tanítási loop-pal:
+
+    allow_ties:
+        Ha False (alapértelmezett), a preferenciák HOLTVERSENY NÉLKÜLIEK:
+        minden partner külön rangot kap (numerikusan a régi adattal
+        egyezik, csak a reprezentáció réteges). Ha True, a közeli
+        pontszámú partnerek azonos rangot (holtversenyt) kaphatnak.
 
       - minden irányítatlan párhoz MINDKÉT irányított él bekerül
         (u->v és v->u), ahogy a páros változatban is;
@@ -340,17 +433,31 @@ def graph_to_pyg_data_r_normal(G, group_size):
     nodes = list(G.nodes())
     node_id_map = {n: i for i, n in enumerate(nodes)}
 
-    # Preferenciák normális eloszlású pontszámok alapján rangsorolva.
-    # Minden csomópont minden másik csomópontot rangsorol (önmagát nem).
+    # Preferenciák normális eloszlású pontszámok alapján, RÉTEGELT
+    # formában. prefs[node] = rétegek listája, ahol egy réteg minden tagja
+    # azonos rangú.
+    #   - allow_ties=False (alapértelmezett): HOLTVERSENY NÉLKÜLI, minden
+    #     partner saját egyelemű rétegben -> numerikusan a régi, szigorú
+    #     adattal egyezik (csak a reprezentáció réteges).
+    #   - allow_ties=True: a közeli pontszámú partnerek közös rétegbe
+    #     (holtversenybe) kerülnek -> több partner kaphat azonos rangot.
     prefs = {}
     for node in nodes:
         candidates = [other for other in nodes if other != node]
         scores = np.random.normal(0.0, 1.0, size=len(candidates))
-        prefs[node] = _ranking_from_scores(candidates, scores)
+        if allow_ties:
+            prefs[node] = _tiered_ranking_from_scores(
+                candidates, list(scores)
+            )
+        else:
+            prefs[node] = _strict_tiers_from_scores(
+                candidates, list(scores)
+            )
 
-    # rank_of[u][v] = u mennyire rangsorolja v-t (0 = legjobb).
+    # rank_of[u][v] = u mennyire rangsorolja v-t (0 = legjobb). Réteges
+    # formánál egy réteg minden tagja AZONOS rangot kap (holtverseny).
     rank_of = {
-        u: {v: r for r, v in enumerate(pref_list)}
+        u: _tier_rank_of(pref_list)
         for u, pref_list in prefs.items()
     }
 
@@ -363,6 +470,8 @@ def graph_to_pyg_data_r_normal(G, group_size):
         ui, vi = node_id_map[u], node_id_map[v]
 
         # u -> v irányított él "minősége": jobb partner -> nagyobb érték.
+        # A rang a RÉTEG indexe, így a holtversenyben lévő partnerek
+        # azonos minőséget (quality) kapnak.
         q_uv = 1.0 - rank_of[u][v] / num_others
         # v -> u irányított él "minősége".
         q_vu = 1.0 - rank_of[v][u] / num_others
@@ -380,6 +489,8 @@ def graph_to_pyg_data_r_normal(G, group_size):
     edge_y = torch.zeros(edge_index.size(1), dtype=torch.float)
 
     # 4 dimenziós, kézzel számolt node-embedding (mint az r_random-ben).
+    # A holtversenyes (réteges) preferenciákkal a "legjobb"/"legrosszabb"
+    # réteg TÖBB tagot is tartalmazhat, a rang pedig a réteg indexe.
     who_am_i = 0
     data_x = []
     for node in nodes:
@@ -391,12 +502,20 @@ def graph_to_pyg_data_r_normal(G, group_size):
         for node_ in nodes:
             if node_ == node:
                 continue
-            if prefs[node_][0] == node:
+            other_pref = prefs[node_]
+            other_rank_of = rank_of[node_]
+            best_rank = 0
+            worst_rank = len(other_pref) - 1  # utolsó réteg indexe
+            r = other_rank_of[node]
+            # Hányan tartják `node`-ot a LEGJOBB rétegükben.
+            if r == best_rank:
                 data_x[who_am_i][0] += 1
-            if prefs[node_][-1] == node:
+            # Hányan tartják `node`-ot a LEGROSSZABB rétegükben.
+            if r == worst_rank:
                 data_x[who_am_i][2] -= 1
-            data_x[who_am_i][1] += prefs[node_].index(node) + 1
-            ranks.append(prefs[node_].index(node))
+            # Rang-összeg (réteg index + 1).
+            data_x[who_am_i][1] += r + 1
+            ranks.append(r)
         ranks.sort()
         data_x[who_am_i][3] = statistics.median(ranks)
         who_am_i += 1
@@ -404,16 +523,25 @@ def graph_to_pyg_data_r_normal(G, group_size):
 
     # Szobatárs esetben nincs proposer/proposee felosztás: a teljes
     # preferencia a proposer_pref-be kerül, a proposee_pref üres.
-    # A kulcsokat és értékeket a leképezett (mapped) node-id-kkel adjuk meg,
-    # hogy egyezzenek az edge_index indexeivel (preference_lists_to_edge_ranks
-    # ezekkel az id-kkal keres).
+    # A preferencia RÉTEGELT formában marad (listák listája), a kulcsokat
+    # és a tagokat a leképezett (mapped) node-id-kkel adjuk meg, hogy
+    # egyezzenek az edge_index indexeivel. A
+    # preference_lists_to_edge_ranks felismeri a réteges formát és a
+    # holtversenyben lévő partnereknek azonos rangot ad.
     proposer_pref = {
-        node_id_map[u]: [node_id_map[v] for v in pref_list]
+        node_id_map[u]: [
+            [node_id_map[v] for v in tier]
+            for tier in pref_list
+        ]
         for u, pref_list in prefs.items()
     }
     proposee_pref = {}
 
     # Szomszédos preferencia-párok irányított él-indexei (ranking-tanítójel).
+    # Holtversenynél CSAK a rétegHATÁROKON túli párokat tekintjük
+    # jobb/rosszabb viszonynak: egy rétegen belüli tagok azonos rangúak,
+    # így NEM alkotnak better/worse párt. Minden réteg legutolsó tagját a
+    # következő réteg első tagjával kötjük össze.
     edge_id_of = {}
     for eid, (a, b) in enumerate(edges):
         edge_id_of[(a, b)] = eid
@@ -422,17 +550,29 @@ def graph_to_pyg_data_r_normal(G, group_size):
     worse_indices = []
     for u, pref_list in prefs.items():
         ui = node_id_map[u]
-        edge_ids = []
-        for v in pref_list:
-            vi = node_id_map[v]
-            if (ui, vi) in edge_id_of:
-                edge_ids.append(edge_id_of[(ui, vi)])
 
-        if len(edge_ids) < 2:
-            continue
-        for i in range(len(edge_ids) - 1):
-            better_indices.append(edge_ids[i])
-            worse_indices.append(edge_ids[i + 1])
+        # Rétegenként az él-id-k, a rétegsorrend megtartásával.
+        tier_edge_ids = []  # list[list[int]] rétegenként
+        for tier in pref_list:
+            ids = []
+            for v in tier:
+                vi = node_id_map[v]
+                if (ui, vi) in edge_id_of:
+                    ids.append(edge_id_of[(ui, vi)])
+            tier_edge_ids.append(ids)
+
+        # Egymást követő, NEM üres rétegek között húzunk better->worse élt
+        # (az előző réteg bármely tagja jobb a következő réteg bármely
+        # tagjánál). A párosítási tanítójelhez elég rétegenként egy
+        # reprezentatív pár (előző réteg utolsó -> következő réteg első).
+        prev_ids = None
+        for ids in tier_edge_ids:
+            if not ids:
+                continue
+            if prev_ids is not None:
+                better_indices.append(prev_ids[-1])
+                worse_indices.append(ids[0])
+            prev_ids = ids
 
     better_indices = torch.tensor(better_indices, dtype=torch.long)
     worse_indices = torch.tensor(worse_indices, dtype=torch.long)
