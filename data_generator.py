@@ -396,7 +396,7 @@ def _flatten_tiers(pref_list):
     return list(pref_list)
 
 
-def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False):
+def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False, score_fn=None):
     """
     A `graph_to_pyg_data_normal` stabil-szobatárs (roommate) változata.
 
@@ -411,6 +411,17 @@ def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False):
         minden partner külön rangot kap (numerikusan a régi adattal
         egyezik, csak a reprezentáció réteges). Ha True, a közeli
         pontszámú partnerek azonos rangot (holtversenyt) kaphatnak.
+
+    score_fn:
+        Opcionális `size -> 1D pontszám-tömb` függvény, amely a
+        preferencia-pontszámokat adja (kisebb pontszám = jobb partner, a
+        rangsor ezek szerint növekvő). Ha None, a pontszámok STANDARD
+        NORMÁLIS eloszlásból (N(0,1)) jönnek, azaz a jelenlegi, bevált
+        viselkedés. Más eloszlásokhoz lásd a `graph_to_pyg_data_r_*`
+        wrappereket (uniform, exponenciális, power-law stb.), amelyek
+        ugyanezt a konvertert hívják más `score_fn`-nel. Így az ÚJ
+        gráfok a mostani holtversenyes szobatárs-problémához NAGYON
+        HASONLÓK, csak a preferenciák eloszlása tér el.
 
       - minden irányítatlan párhoz MINDKÉT irányított él bekerül
         (u->v és v->u), ahogy a páros változatban is;
@@ -442,9 +453,13 @@ def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False):
     #   - allow_ties=True: a közeli pontszámú partnerek közös rétegbe
     #     (holtversenybe) kerülnek -> több partner kaphat azonos rangot.
     prefs = {}
+    # A pontszám-eloszlás függvénye: ha nincs megadva, standard normális.
+    if score_fn is None:
+        score_fn = lambda size: np.random.normal(0.0, 1.0, size=size)
+
     for node in nodes:
         candidates = [other for other in nodes if other != node]
-        scores = np.random.normal(0.0, 1.0, size=len(candidates))
+        scores = score_fn(len(candidates))
         if allow_ties:
             prefs[node] = _tiered_ranking_from_scores(
                 candidates, list(scores)
@@ -589,6 +604,237 @@ def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False):
         rank_worse_idx=worse_indices,
     )
     return data
+
+
+# ---------------------------------------------------------------------------
+# Szobatárs (roommate) gráfok MÁS preferencia-eloszlásokkal.
+#
+# Mindegyik converter TELJESEN AZONOS a `graph_to_pyg_data_r_normal`-lal
+# (ugyanaz a réteges/holtversenyes reprezentáció, edge_attr, data_x,
+# rank_better/worse_idx, proposer_pref stb.), KIZÁRÓLAG a preferencia-
+# pontszámok ELOSZLÁSA tér el. Így közvetlenül összehasonlítható, hogy a
+# modell mennyire általánosít más eloszlású preferenciákra.
+#
+# A pontszámokat minden eloszlásnál ~egységnyi szórásúra normalizáljuk,
+# hogy a `_tiered_ranking_from_scores` 0.6-os bucketje hasonló
+# holtverseny-gyakoriságot adjon, mint a normális esetben (különben a
+# holtversenyek sűrűsége erősen eltérne eloszlásonként).
+# A pontszámok ELŐJELE/skálája közömbös a rangsor szempontjából (csak a
+# relatív sorrend számít), de a bucketeléshez a skála lényeges.
+# ---------------------------------------------------------------------------
+
+
+def graph_to_pyg_data_r_uniform(G, group_size, allow_ties=False):
+    """Szobatárs gráf EGYENLETES (uniform) eloszlású preferencia-pontszámokkal.
+
+    A pontszámok U(0,1)-ből jönnek, ~egységnyi szórásúra skálázva. A
+    többi (reprezentáció, mezők) megegyezik `graph_to_pyg_data_r_normal`-lal.
+    """
+    def score_fn(size):
+        # U(0,1) szórása ~0.2887; /0.2887 ~ egységnyi szórás.
+        return np.random.uniform(0.0, 1.0, size=size) / 0.2887
+
+    return graph_to_pyg_data_r_normal(
+        G, group_size, allow_ties=allow_ties, score_fn=score_fn
+    )
+
+
+def graph_to_pyg_data_r_exponential(G, group_size, allow_ties=False):
+    """Szobatárs gráf EXPONENCIÁLIS eloszlású preferencia-pontszámokkal.
+
+    Erősen jobbra ferde eloszlás: sok közeli (jó) és néhány kiugró (rossz)
+    pontszám. Exp(1) szórása 1, így skálázás nem szükséges. A többi
+    megegyezik `graph_to_pyg_data_r_normal`-lal.
+    """
+    def score_fn(size):
+        return np.random.exponential(1.0, size=size)
+
+    return graph_to_pyg_data_r_normal(
+        G, group_size, allow_ties=allow_ties, score_fn=score_fn
+    )
+
+
+def graph_to_pyg_data_r_powerlaw(G, group_size, allow_ties=False):
+    """Szobatárs gráf POWER-LAW (Pareto) eloszlású preferencia-pontszámokkal.
+
+    Nehéz farkú eloszlás: néhány csomópont sokkal "jobb"/"rosszabb"
+    pontszámot kaphat. Pareto(a=3)-ból mintázunk, majd ~egységnyi szórásúra
+    skálázunk. A többi megegyezik `graph_to_pyg_data_r_normal`-lal.
+    """
+    a = 3.0
+    # Pareto(a) szórása (a>2): sqrt(a / ((a-1)^2 (a-2))).
+    std = (a / (((a - 1.0) ** 2) * (a - 2.0))) ** 0.5
+
+    def score_fn(size):
+        return np.random.pareto(a, size=size) / std
+
+    return graph_to_pyg_data_r_normal(
+        G, group_size, allow_ties=allow_ties, score_fn=score_fn
+    )
+
+
+def graph_to_pyg_data_r_bimodal(G, group_size, allow_ties=False):
+    """Szobatárs gráf BIMODÁLIS (két csúcsú) preferencia-pontszámokkal.
+
+    Két normális komponens keveréke (az egyik ~ -2, a másik ~ +2 körül),
+    ami "polarizált" preferenciákat ad: a partnerek jellemzően vagy
+    "jók", vagy "rosszak", kevés köztes. ~egységnyi szórásúra skálázva.
+    A többi megegyezik `graph_to_pyg_data_r_normal`-lal.
+    """
+    def score_fn(size):
+        # Komponensválasztás 50/50, középpontok -2 és +2, szórás 0.5.
+        comp = np.random.randint(0, 2, size=size)
+        centers = np.where(comp == 0, -2.0, 2.0)
+        raw = centers + np.random.normal(0.0, 0.5, size=size)
+        # A keverék szórása ~ sqrt(2^2 + 0.5^2) ~ 2.06; egységnyire skáláz.
+        return raw / 2.06
+
+    return graph_to_pyg_data_r_normal(
+        G, group_size, allow_ties=allow_ties, score_fn=score_fn
+    )
+
+
+def graph_to_pyg_data_r_top_ties(G, group_size, allow_ties=True):
+    """Szobatárs gráf, ahol az ELSŐ (legjobb) helyen NAGY VALÓSZÍNŰSÉGGEL SOK a tie.
+
+    Célzottan olyan preferencia-pontszámokat gyárt, hogy a `_tiered_ranking_
+    from_scores` kvantálása után a LEGJOBB réteg (tier 0) tipikusan több
+    tagot tartalmazzon -> sok holtverseny az első helyen.
+
+    Hogyan: a jelöltek egy VÉLETLEN hányada egy szűk "top platóra" kerül a
+    pontszám-minimum közelében (a kvantáló `bucket`-jénél jóval kisebb
+    szóráson belül), így ezek AZONOS kvantált kulcsot kapnak -> közös,
+    legjobb rétegbe (holtverseny). A maradék jelölt pontszáma jóval nagyobb
+    (rosszabb), és szétszórt, így külön, rosszabb rétegekbe esik.
+
+    A tie-k az `allow_ties=True` esetén jelennek meg (a kvantálás ekkor
+    aktív); `allow_ties=False`-nál a reprezentáció szigorú marad, mint a
+    többi konverternél. A platóméretet mintánként véletlenül választjuk,
+    hogy ne legyen determinisztikus a tie-k száma.
+
+    A `_tiered_ranking_from_scores` alap bucket-je 0.6. A plató szórását
+    ennél jóval kisebbre (~0.05) vesszük, hogy a platótagok megbízhatóan
+    egy rétegbe essenek; a nem-platós jelölteket pedig legalább néhány
+    bucket-nyivel feljebb (rosszabbra) toljuk.
+    """
+    def score_fn(size):
+        if size <= 0:
+            return np.array([], dtype=float)
+        # A plató (top, holtversenyes) jelöltek aránya: 40%..90% a
+        # jelöltek közül, de legalább 2 (hogy legyen tényleges tie), ha a
+        # méret engedi.
+        frac = np.random.uniform(0.4, 0.9)
+        n_top = int(round(frac * size))
+        n_top = max(min(n_top, size), min(2, size))
+
+        scores = np.empty(size, dtype=float)
+        # Top plató: szűk szórású a 0 körül (<< bucket=0.6), így azonos
+        # kvantált kulcs -> közös legjobb réteg.
+        scores[:n_top] = np.random.normal(0.0, 0.05, size=n_top)
+        # A maradék (rosszabb) jelölt: legalább ~2 bucketnyivel feljebb
+        # (>= 1.2), szétszórva, hogy több rosszabb rétegbe essenek.
+        n_rest = size - n_top
+        if n_rest > 0:
+            scores[n_top:] = 1.2 + np.random.exponential(1.0, size=n_rest)
+        # Keverjük, hogy a plató ne a lista elején legyen (a rangsorolást
+        # a pontszám dönti el, a sorrend csak a holtversenyen belül számít).
+        np.random.shuffle(scores)
+        return scores
+
+    return graph_to_pyg_data_r_normal(
+        G, group_size, allow_ties=allow_ties, score_fn=score_fn
+    )
+
+
+def graph_to_pyg_data_r_equal_tiers(G, group_size, allow_ties=True):
+    """Szobatárs gráf, ahol MINDEN tier (réteg) AZONOS méretű (ugyanannyi tie).
+
+    Ugyanúgy épül fel, mint `graph_to_pyg_data_r_top_ties`, de a cél itt az,
+    hogy a `_tiered_ranking_from_scores` kvantálása után MINDEN réteg
+    PONTOSAN ugyanannyi tagot (holtversenyzőt) tartalmazzon.
+
+    Hogyan: a jelölteket EGYENLŐ méretű csoportokra osztjuk, és minden
+    csoportnak egy jól elkülönülő, KÖZÖS pontszám-sávot adunk (szűk
+    szóráson belül, a sávok között a `bucket`-nél jóval nagyobb
+    távolsággal). Így minden csoport külön, egyedi kvantált kulcsot kap ->
+    annyi réteg lesz, ahány csoport, és mindegyik mérete = a csoportméret
+    (tie_size).
+
+    A tier-méret csak akkor lehet MINDENHOL azonos, ha osztja a jelöltek
+    számát. Ezért a kívánt tie-méretet a jelöltszám legközelebbi OSZTÓJÁRA
+    igazítjuk (így garantáltan egyenlő tier-ek jönnek ki). A tie-méretet
+    mintánként véletlenül választjuk az osztók közül (de >= 2, ha lehet),
+    hogy a tie-k száma ne legyen determinisztikus.
+
+    A tie-k az `allow_ties=True` esetén jelennek meg (a kvantálás ekkor
+    aktív); `allow_ties=False`-nál a reprezentáció szigorú marad, mint a
+    többi konverternél.
+
+    A `_tiered_ranking_from_scores` alap bucket-je 0.6. A sávon belüli
+    szórást ennél jóval kisebbre (~0.05) vesszük, a sávközt pedig
+    bucket * 3-ra (= 1.8), hogy a csoportok megbízhatóan külön kulcsokba
+    (külön rétegekbe) essenek.
+    """
+    def _divisors(n):
+        """n osztói növekvő sorrendben (1 és n is benne)."""
+        ds = []
+        for d in range(1, n + 1):
+            if n % d == 0:
+                ds.append(d)
+        return ds
+
+    def score_fn(size):
+        if size <= 0:
+            return np.array([], dtype=float)
+        if size == 1:
+            return np.random.normal(0.0, 0.05, size=1)
+
+        # Lehetséges tie-méretek: a jelöltszám osztói. A triviális size
+        # (minden egy rétegben) kizárható, hogy legyen >1 réteg; a >=2
+        # tie-t preferáljuk, hogy legyen tényleges holtverseny.
+        divisors = [d for d in _divisors(size) if d < size]
+        # Előnyben a >= 2 tie-méret (valódi holtverseny), ha van ilyen.
+        candidates_ts = [d for d in divisors if d >= 2] or divisors
+        tie_size = int(np.random.choice(candidates_ts))
+
+        n_groups = size // tie_size
+        bucket = 0.6
+        band_gap = bucket * 3.0  # jól elkülönülő sávok (külön kulcsok)
+
+        scores = np.empty(size, dtype=float)
+        idx = 0
+        for g in range(n_groups):
+            center = g * band_gap
+            scores[idx:idx + tie_size] = center + np.random.normal(
+                0.0, 0.05, size=tie_size
+            )
+            idx += tie_size
+        # (size osztható tie_size-zal, így idx == size itt.)
+
+        # Keverés: a rangsorolást a pontszám dönti el, a sorrend csak a
+        # holtversenyen belül számít; a sávok így is külön rétegekbe esnek.
+        np.random.shuffle(scores)
+        return scores
+
+    return graph_to_pyg_data_r_normal(
+        G, group_size, allow_ties=allow_ties, score_fn=score_fn
+    )
+
+
+# A szobatárs (roommate) PyG-konverterek halmaza. Mindegyik ugyanazt a
+# réteges reprezentációt és mezőkészletet adja, és támogatja az
+# `allow_ties` paramétert; kizárólag a preferencia-pontszámok eloszlása
+# tér el. A `get_or_generate_dataset` ez alapján dönti el, hogy át kell-e
+# adni az `allow_ties` paramétert a konverternek.
+ROOMMATE_CONVERTERS = (
+    graph_to_pyg_data_r_normal,
+    graph_to_pyg_data_r_uniform,
+    graph_to_pyg_data_r_exponential,
+    graph_to_pyg_data_r_powerlaw,
+    graph_to_pyg_data_r_bimodal,
+    graph_to_pyg_data_r_top_ties,
+    graph_to_pyg_data_r_equal_tiers,
+)
 
 
 def graph_to_pyg_data_normal(G, group_size):

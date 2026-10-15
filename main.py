@@ -215,8 +215,8 @@ def matching_ranking_loss(
     return total, metrics, matching_scores
 
 # Legfeljebb ennyi teljes matchinget állítunk elő gráfonként. Ha a gráfnak
-# ennél több teljes matchingje van, akkor nem soroljuk fel mindet (ami
-# faktoriális lenne), hanem egy stabil matchingből kiindulva random
+# ennél több teljes matchingje van, akkor nem soroljuk fel mindet,
+# hanem egy stabil matchingből kiindulva random
 # perturbációval mintázunk összesen MAX_SAMPLED_MATCHINGS darabot.
 MAX_SAMPLED_MATCHINGS = 10
 
@@ -1607,208 +1607,6 @@ def greedy_decode_pairs(
 
     return partner
 
-def soft_blocking_pair_loss(
-    edge_index: torch.Tensor,
-    ranks: torch.Tensor,
-    directed_logits: torch.Tensor,
-    num_nodes: int,
-    temperature: float = 0.0001,
-) -> torch.Tensor:
-    """
-    Differenciálható soft blocking-pair loss.
-
-    Parameters
-    ----------
-    edge_index:
-        [2, E] directed preferenciaélek.
-
-    ranks:
-        [E] vagy [E, F].
-        ranks[e] = a source agent preferenciarangja a targetre.
-        Kisebb rank = jobb partner.
-
-    directed_logits:
-        [E], raw decoder logits.
-
-    num_nodes:
-        Node-ok száma.
-
-    temperature:
-        A sigmoid hőmérséklete.
-        Kisebb érték -> közelebb bináris kiválasztáshoz.
-
-    Returns
-    -------
-    Scalar tensor, amelyhez van gradient directed_logits felé.
-    """
-    if ranks.ndim == 2:
-        ranks = ranks[:, 0]
-
-    if ranks.ndim != 1:
-        raise ValueError(
-            "ranks shape-ja [E] vagy [E,F] legyen."
-        )
-
-    if directed_logits.ndim != 1:
-        raise ValueError(
-            "directed_logits shape-ja [E] legyen."
-        )
-
-    if edge_index.size(1) != directed_logits.numel():
-        raise ValueError(
-            "edge_index és directed_logits élszáma eltér."
-        )
-
-    device = directed_logits.device
-    dtype = directed_logits.dtype
-
-    src = edge_index[0]
-    dst = edge_index[1]
-    num_edges = edge_index.size(1)
-
-    # p(u -> v), differentiálható a decoder logitokra.
-    directed_prob = torch.sigmoid(
-        directed_logits / temperature
-    )  # [E]
-
-    # Python dict csak indexeket tárol, nem tensorértékeket:
-    # ettől a directed_prob felé a gradient nem szakad meg.
-    edge_id_of = {
-        (int(src[e].item()), int(dst[e].item())): e
-        for e in range(num_edges)
-    }
-
-    # Minden kölcsönös párra tároljuk:
-    # u, v, uv_eid, vu_eid, rank_u(v), rank_v(u)
-    pair_data = []
-
-    for (u, v), uv_eid in edge_id_of.items():
-        if u >= v:
-            continue
-
-        vu_eid = edge_id_of.get((v, u))
-
-        if vu_eid is None:
-            continue
-
-        pair_data.append(
-            (
-                u,
-                v,
-                uv_eid,
-                vu_eid,
-            )
-        )
-
-    if len(pair_data) == 0:
-        return directed_logits.sum() * 0.0
-
-    # P kölcsönös, irányítatlan candidate pair.
-    pair_u = torch.tensor(
-        [item[0] for item in pair_data],
-        dtype=torch.long,
-        device=device,
-    )
-    pair_v = torch.tensor(
-        [item[1] for item in pair_data],
-        dtype=torch.long,
-        device=device,
-    )
-
-    uv_eids = torch.tensor(
-        [item[2] for item in pair_data],
-        dtype=torch.long,
-        device=device,
-    )
-    vu_eids = torch.tensor(
-        [item[3] for item in pair_data],
-        dtype=torch.long,
-        device=device,
-    )
-
-    # p_{u,v}: mindkét irány magas legyen.
-    p_pair = (
-        directed_prob[uv_eids]
-        * directed_prob[vu_eids]
-    )  # [P]
-
-    rank_u_to_v = ranks[uv_eids]  # [P]
-    rank_v_to_u = ranks[vu_eids]  # [P]
-
-    total_loss = directed_logits.new_zeros(())
-
-    # Egyszerűség kedvéért P^2 ciklus.
-    # Kis graphokra / első debugra teljesen jó.
-    for p in range(len(pair_data)):
-        u = pair_u[p]
-        v = pair_v[p]
-
-        # Minden olyan pair q-t keresünk, amely:
-        # - u-t tartalmazza,
-        # - u a q másik endpointját v-nél rosszabbnak preferálja.
-        desire_u_for_v = directed_logits.new_zeros(())
-
-        # Ugyanez v oldalról.
-        desire_v_for_u = directed_logits.new_zeros(())
-
-        for q in range(len(pair_data)):
-            if p == q:
-                continue
-
-            a = pair_u[q]
-            b = pair_v[q]
-
-            # q = {u, w}; keressük rank_u(w)-t.
-            if a.item() == u.item():
-                w = b
-                q_rank_u_to_w = rank_u_to_v[q]
-
-                if rank_u_to_v[p] < q_rank_u_to_w:
-                    desire_u_for_v = (
-                        desire_u_for_v + p_pair[q]
-                    )
-
-            elif b.item() == u.item():
-                w = a
-                q_rank_u_to_w = rank_v_to_u[q]
-
-                if rank_u_to_v[p] < q_rank_u_to_w:
-                    desire_u_for_v = (
-                        desire_u_for_v + p_pair[q]
-                    )
-
-            # q = {v, z}; keressük rank_v(z)-t.
-            if a.item() == v.item():
-                z = b
-                q_rank_v_to_z = rank_u_to_v[q]
-
-                if rank_v_to_u[p] < q_rank_v_to_z:
-                    desire_v_for_u = (
-                        desire_v_for_u + p_pair[q]
-                    )
-
-            elif b.item() == v.item():
-                z = a
-                q_rank_v_to_z = rank_v_to_u[q]
-
-                if rank_v_to_u[p] < q_rank_v_to_z:
-                    desire_v_for_u = (
-                        desire_v_for_u + p_pair[q]
-                    )
-
-        # Ha p pair nem kiválasztott, és mindkét oldal
-        # soft módon rosszabb partnerhez van rendelve,
-        # akkor büntetjük.
-        blocking_mass = (
-            (1.0 - p_pair[p])
-            * desire_u_for_v
-            * desire_v_for_u
-        )
-
-        total_loss = total_loss + blocking_mass
-
-    # Az instance méretétől kevésbé függjön a loss.
-    return total_loss / len(pair_data)
 
 
 def find_blocking_pairs(
@@ -1938,6 +1736,7 @@ def classify_stability_level(
     edge_index: torch.Tensor,
     edge_ranks: torch.Tensor,
     partner: torch.Tensor,
+    debug: bool = False,
 ) -> str:
     """
     Egy párosítás LEGERŐSEBB teljesülő SRT (holtversenyes) stabilitási
@@ -1982,6 +1781,20 @@ def classify_stability_level(
     for u, v, r in zip(src, dst, rvals):
         rank_of.setdefault(u, {})[v] = float(r)
 
+    if debug:
+        print("\n==== classify_stability_level DEBUG ====")
+        print(f"Node-ok száma (partner tömb): {len(partner)}")
+        print("Partnerek (partner[u] = v, -1 = párosítatlan):")
+        for a in range(len(partner)):
+            p = partner[a]
+            print(f"  node {a:>3} -> partner {p}" + ("  [PÁROSÍTATLAN]" if p == -1 else ""))
+        print("Rang-térkép (rank_of[u][v], kisebb = jobb; holtverseny = azonos rang):")
+        for u in sorted(rank_of):
+            items = ", ".join(
+                f"{v}:{rank_of[u][v]:g}" for v in sorted(rank_of[u])
+            )
+            print(f"  node {u:>3}: {{{items}}}")
+
     def rank_to_partner(agent: int) -> float:
         """Az agent jelenlegi partnerének rangja; unmatched/ismeretlen = +inf
         (azaz bárki elfogadható partner jobb nála)."""
@@ -1996,6 +1809,9 @@ def classify_stability_level(
     has_strong_block = False
     has_weak_block = False
 
+    if debug:
+        print("\n-- Kanonikus (u<v, kölcsönösen elfogadható, nem egymás párja) párok vizsgálata --")
+
     for u, neighbors in rank_of.items():
         cur_u = rank_to_partner(u)
         for v, r_uv in neighbors.items():
@@ -2003,9 +1819,13 @@ def classify_stability_level(
                 continue
             # Kölcsönös elfogadhatóság.
             if u not in rank_of.get(v, {}):
+                if debug and u < v:
+                    print(f"  ({u},{v}): kihagyva - NEM kölcsönösen elfogadható (v nem fogadja el u-t)")
                 continue
             # Egymás párja: nem blokkol.
             if partner[u] == v:
+                if debug and u < v:
+                    print(f"  ({u},{v}): kihagyva - EGYMÁS PÁRJA (nem blokkol)")
                 continue
             # Csak egy irányból dolgozzuk fel a kanonikus párt.
             if u > v:
@@ -2021,14 +1841,38 @@ def classify_stability_level(
             v_weak = r_vu <= cur_v
 
             # super-blokk: mindkettő gyengén preferál.
-            if u_weak and v_weak:
-                has_super_block = True
+            is_super = u_weak and v_weak
             # strong-blokk: egyik szigorú, másik gyenge.
-            if (u_strict and v_weak) or (u_weak and v_strict):
-                has_strong_block = True
+            is_strong = (u_strict and v_weak) or (u_weak and v_strict)
             # weak-blokk: mindkettő szigorú.
-            if u_strict and v_strict:
+            is_weak = u_strict and v_strict
+
+            if is_super:
+                has_super_block = True
+            if is_strong:
+                has_strong_block = True
+            if is_weak:
                 has_weak_block = True
+
+            if debug:
+                def fmt(x):
+                    return "+inf" if x == float("inf") else f"{x:g}"
+                tags = []
+                if is_weak:
+                    tags.append("WEAK-BLOKK")
+                if is_strong:
+                    tags.append("STRONG-BLOKK")
+                if is_super:
+                    tags.append("SUPER-BLOKK")
+                tag_str = ", ".join(tags) if tags else "nem blokkol"
+                print(
+                    f"  ({u},{v}): "
+                    f"u={u} r(u->v)={fmt(r_uv)} vs partnere r={fmt(cur_u)} "
+                    f"[{'szig.' if u_strict else ('gyenge' if u_weak else 'rosszabb')}] | "
+                    f"v={v} r(v->u)={fmt(r_vu)} vs partnere r={fmt(cur_v)} "
+                    f"[{'szig.' if v_strict else ('gyenge' if v_weak else 'rosszabb')}] "
+                    f"=> {tag_str}"
+                )
 
             # Ha már weak-blokk is van, erősebbet nem tudunk teljesíteni.
             if has_weak_block:
@@ -2037,12 +1881,30 @@ def classify_stability_level(
                 # super/strong flagek már True-k lennének, így korrekt.
                 pass
 
+    if debug:
+        print("\n-- Összegzés (van-e blokkoló pár az adott szinten) --")
+        print(f"  super-blokk  van? {has_super_block}")
+        print(f"  strong-blokk van? {has_strong_block}")
+        print(f"  weak-blokk   van? {has_weak_block}")
+
     if not has_super_block:
+        if debug:
+            print("  => Nincs super-blokk  => SZINT: super")
+            print("==== /classify_stability_level DEBUG ====\n")
         return "super"
     if not has_strong_block:
+        if debug:
+            print("  => Nincs strong-blokk => SZINT: strong")
+            print("==== /classify_stability_level DEBUG ====\n")
         return "strong"
     if not has_weak_block:
+        if debug:
+            print("  => Nincs weak-blokk   => SZINT: weak")
+            print("==== /classify_stability_level DEBUG ====\n")
         return "weak"
+    if debug:
+        print("  => Van weak-blokk     => SZINT: unstable")
+        print("==== /classify_stability_level DEBUG ====\n")
     return "unstable"
 
 
@@ -2115,10 +1977,11 @@ def get_or_generate_dataset(
     def make_sample():
         gs = pick_size()
         G = graph_fn(gs)
-        # A szobatárs (roommate) konverter támogatja a holtversenyt
+        # A szobatárs (roommate) konverterek támogatják a holtversenyt
         # (allow_ties); a páros (marriage) konverter nem, ezért oda nem
-        # adjuk át a paramétert.
-        if gen_fn is data_generator.graph_to_pyg_data_r_normal:
+        # adjuk át a paramétert. Bármely regisztrált roommate converter
+        # (különböző preferencia-eloszlások) megkapja az allow_ties-t.
+        if gen_fn in data_generator.ROOMMATE_CONVERTERS:
             return gen_fn(G, gs, allow_ties=allow_ties)
         return gen_fn(G, gs)
 
@@ -2140,6 +2003,74 @@ def get_or_generate_dataset(
     )
     print("Dataset legenerálva és elmentve ide: " + cache_path)
     return train_data, val_data
+
+
+# A különböző preferencia-eloszlású szobatárs (roommate) konverterek
+# név -> converter leképezése, hogy teszteléshez könnyen választható
+# legyen az eloszlás.
+ROOMMATE_DISTRIBUTIONS = {
+    "normal": data_generator.graph_to_pyg_data_r_normal,
+    "uniform": data_generator.graph_to_pyg_data_r_uniform,
+    "exponential": data_generator.graph_to_pyg_data_r_exponential,
+    "powerlaw": data_generator.graph_to_pyg_data_r_powerlaw,
+    "bimodal": data_generator.graph_to_pyg_data_r_bimodal,
+    # Olyan eloszlás, ahol az ELSŐ (legjobb) helyen nagy valószínűséggel
+    # sok a holtverseny (tie). Csak allow_ties=True mellett ad tényleges
+    # tie-kat.
+    "top_ties": data_generator.graph_to_pyg_data_r_top_ties,
+    # Olyan eloszlás, ahol MINDEN tier (réteg) azonos méretű, azaz minden
+    # rétegben ugyanannyi a holtverseny. Csak allow_ties=True mellett ad
+    # tényleges tie-kat.
+    "equal_tiers": data_generator.graph_to_pyg_data_r_equal_tiers,
+}
+
+
+def get_or_generate_roommate_test_dataset(
+    distribution,
+    group_sizes=(6, 8, 10, 12),
+    n_train=1000,
+    n_val=500,
+    allow_ties=True,
+    seed=42,
+    cache_path=None,
+):
+    """
+    Szobatárs (roommate) TESZT-adathalmaz a megadott preferencia-
+    eloszlással. A `graph_to_pyg_data_r_normal`-lal (jelenlegi holtversenyes
+    szobatárs-probléma) MINDEN szempontból megegyezik, KIZÁRÓLAG a
+    preferencia-pontszámok eloszlása más.
+
+    distribution:
+        "normal" | "uniform" | "exponential" | "powerlaw" | "bimodal"
+        (lásd ROOMMATE_DISTRIBUTIONS).
+
+    A visszatérés és a cache-séma megegyezik a `get_or_generate_dataset`-tel.
+    """
+    if distribution not in ROOMMATE_DISTRIBUTIONS:
+        raise ValueError(
+            f"Ismeretlen eloszlás: {distribution!r}. "
+            f"Választható: {sorted(ROOMMATE_DISTRIBUTIONS)}"
+        )
+
+    gen_fn = ROOMMATE_DISTRIBUTIONS[distribution]
+
+    if cache_path is None:
+        cache_path = f"dataset_roommate_{distribution}.pt"
+
+    return get_or_generate_dataset(
+        # A szobatárs esetben a méret = node-szám; a group_sizes már
+        # node-számokban (6,8,10,12) van megadva, a group_size csak
+        # cache-kulcs/fallback.
+        group_size=group_sizes[0],
+        gen_fn=gen_fn,
+        graph_fn=data_generator.generate_graph_r,
+        n_train=n_train,
+        n_val=n_val,
+        cache_path=cache_path,
+        seed=seed,
+        group_sizes=list(group_sizes),
+        allow_ties=allow_ties,
+    )
 
 
 def get_or_generate_mixed_dataset(
@@ -2260,6 +2191,93 @@ def get_or_generate_mixed_dataset(
     return train_data, val_data
 
 
+def build_decoder_input(out):
+    return torch.cat(
+            [
+            out.edge_embedding,  # [E, 128]
+            out.auxiliary["mutual_quality"].unsqueeze(-1),  # [E, 1]
+            out.auxiliary["rank_score"].unsqueeze(-1),  # [E, 1]
+        ],
+        dim=-1,
+    )
+
+
+def is_roommate_graph(graph):
+    """
+    Egy gráf szobatárs-típusú-e. A `graph_to_pyg_data_r_normal` üres
+    proposee_pref-et ad (nincs oldal-felosztás), míg a házassági
+    (bipartite) konverterek kitöltik mindkét oldalt. Ez alapján
+    dönthető el per-gráf a típus a kevert adathalmazban.
+    """
+    proposee = getattr(graph, "proposee_pref", None)
+    return not proposee
+
+
+
+def prepare_dataset_ranking(
+        dataset,
+        left_nodes,
+        right_nodes,
+        roommate=False,
+        mixed=False,
+):
+    ranking_dataset = []
+
+    for graph in dataset:
+        preferences = (
+                graph.proposee_pref | graph.proposer_pref
+        )
+
+        edge_ranks = preference_lists_to_edge_ranks(
+            preferences,
+            graph.edge_index,
+        )
+
+        # Kevert adathalmaznál per-gráf dönt a típus; egyébként a
+        # globális `roommate` flag.
+        use_roommate = (
+            is_roommate_graph(graph) if mixed else roommate
+        )
+
+        if use_roommate:
+            ranking_data = prepare_matching_ranking_data_roommate(
+                edge_index=graph.edge_index,
+                edge_ranks=edge_ranks,
+                num_nodes=graph.num_nodes,
+                preferences=preferences,
+            )
+        else:
+            # Páros (marriage) gráfnál a bal/jobb oldali node-okat
+            # per-gráf a saját méretéből származtatjuk, hogy a vegyes
+            # méretű train adathalmaz (group_size 3..6) is helyes
+            # oldal-felosztást kapjon. A konverter (generate_graph_m +
+            # graph_to_pyg_data_normal) a 0..n-1 node-okat teszi a bal,
+            # az n..2n-1 node-okat a jobb oldalra, ahol n = num_nodes/2.
+            if mixed:
+                half = graph.num_nodes // 2
+                g_left_nodes = list(range(half))
+                g_right_nodes = list(range(half, graph.num_nodes))
+            else:
+                g_left_nodes = left_nodes
+                g_right_nodes = right_nodes
+
+            ranking_data = prepare_matching_ranking_data(
+                edge_index=graph.edge_index,
+                edge_ranks=edge_ranks,
+                num_nodes=graph.num_nodes,
+                left_nodes=g_left_nodes,
+                right_nodes=g_right_nodes,
+                preferences=preferences,
+            )
+
+        ranking_dataset.append(ranking_data)
+
+    return ranking_dataset
+
+
+
+
+
 def main(training=False, roommate=True, mixed=False, allow_ties=False):
 
     group_size=3
@@ -2290,6 +2308,7 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         # informatív (lásd a méret szerinti metrikákat a kiértékelésben).
         # A `group_size` csak a cache-kulcs része / fallback marad.
         roommate_nodes = 2 * group_size
+        """
         train_data, val_data = get_or_generate_dataset(
             roommate_nodes,
             gen_fn=data_generator.graph_to_pyg_data_r_normal,
@@ -2300,6 +2319,10 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
             seed=42,
             group_sizes=[2 * gs for gs in (3, 4, 5, 6)],
             allow_ties=allow_ties,
+        )
+        """
+        train_data, val_data = get_or_generate_roommate_test_dataset(
+            "normal", allow_ties=True, n_val=500,
         )
     else:
         # Páros (bipartite) eset: generate_graph_m bázisgráf.
@@ -2313,10 +2336,6 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
             seed=42,
         )
 
-
-
-
-
     enc = encoder.StableMatchingEdgeEncoder(
         node_feature_dim=train_data[0].x.shape[1],
         edge_feature_dim=1,
@@ -2327,126 +2346,6 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         edge_embedding_dim=34,
         hidden_dim=34,
     )
-
-    def build_decoder_input(out):
-        return torch.cat(
-            [
-                out.edge_embedding,  # [E, 128]
-                out.auxiliary["mutual_quality"].unsqueeze(-1),  # [E, 1]
-                out.auxiliary["rank_score"].unsqueeze(-1),  # [E, 1]
-            ],
-            dim=-1,
-        )
-
-    def eval_joint_loss(dataset):
-        enc.eval()
-        dec.eval()
-        total = 0.0
-        count = 0
-        with torch.no_grad():
-            for graph in dataset:
-                edge_attr = graph.edge_attr.float()
-                if edge_attr.ndim == 1:
-                    edge_attr = edge_attr.unsqueeze(-1)
-                out = enc(
-                    x=graph.x.float(),
-                    edge_index=graph.edge_index,
-                    edge_attr=edge_attr,
-                )
-                loss_enc, _ = encoder_loss(out=out, batch=graph)
-                edge_logits = dec(build_decoder_input(out))
-
-                ranks = preference_lists_to_edge_ranks(
-                    graph.proposee_pref | graph.proposer_pref, graph.edge_index
-                )
-                criterion_eval = BlockingPairLoss(
-                    edge_index=graph.edge_index,
-                    edge_ranks=ranks,
-                    num_nodes=graph.num_nodes,
-                    degree_weight=1.0,
-                    temperature=0.01,
-                    reduction="mean",
-                )
-                loss_dec_eval, parts_ = criterion_eval(edge_logits)
-                total += (
-                    loss_enc*0.5 + loss_dec_eval*0.5
-                ).item()
-                count += 1
-        return total / max(count, 1)
-
-    joint_patience = 5
-    min_delta = 1e-4
-
-    def is_roommate_graph(graph):
-        """
-        Egy gráf szobatárs-típusú-e. A `graph_to_pyg_data_r_normal` üres
-        proposee_pref-et ad (nincs oldal-felosztás), míg a házassági
-        (bipartite) konverterek kitöltik mindkét oldalt. Ez alapján
-        dönthető el per-gráf a típus a kevert adathalmazban.
-        """
-        proposee = getattr(graph, "proposee_pref", None)
-        return not proposee
-
-    def prepare_dataset_ranking(
-            dataset,
-            left_nodes,
-            right_nodes,
-            roommate=False,
-            mixed=False,
-    ):
-        ranking_dataset = []
-
-        for graph in dataset:
-            preferences = (
-                    graph.proposee_pref | graph.proposer_pref
-            )
-
-            edge_ranks = preference_lists_to_edge_ranks(
-                preferences,
-                graph.edge_index,
-            )
-
-            # Kevert adathalmaznál per-gráf dönt a típus; egyébként a
-            # globális `roommate` flag.
-            use_roommate = (
-                is_roommate_graph(graph) if mixed else roommate
-            )
-
-            if use_roommate:
-                ranking_data = prepare_matching_ranking_data_roommate(
-                    edge_index=graph.edge_index,
-                    edge_ranks=edge_ranks,
-                    num_nodes=graph.num_nodes,
-                    preferences=preferences,
-                )
-            else:
-                # Páros (marriage) gráfnál a bal/jobb oldali node-okat
-                # per-gráf a saját méretéből származtatjuk, hogy a vegyes
-                # méretű train adathalmaz (group_size 3..6) is helyes
-                # oldal-felosztást kapjon. A konverter (generate_graph_m +
-                # graph_to_pyg_data_normal) a 0..n-1 node-okat teszi a bal,
-                # az n..2n-1 node-okat a jobb oldalra, ahol n = num_nodes/2.
-                if mixed:
-                    half = graph.num_nodes // 2
-                    g_left_nodes = list(range(half))
-                    g_right_nodes = list(range(half, graph.num_nodes))
-                else:
-                    g_left_nodes = left_nodes
-                    g_right_nodes = right_nodes
-
-                ranking_data = prepare_matching_ranking_data(
-                    edge_index=graph.edge_index,
-                    edge_ranks=edge_ranks,
-                    num_nodes=graph.num_nodes,
-                    left_nodes=g_left_nodes,
-                    right_nodes=g_right_nodes,
-                    preferences=preferences,
-                )
-
-            ranking_dataset.append(ranking_data)
-
-        return ranking_dataset
-
 
     optimizer_joint = torch.optim.AdamW(
         list(enc.parameters()) + list(dec.parameters()),
@@ -2467,60 +2366,9 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         mixed=mixed,
     )
 
-    val_ranking = prepare_dataset_ranking(
-        val_data,
-        left_nodes,
-        right_nodes,
-        roommate=roommate,
-        mixed=mixed,
-    )
-
     encoder_weight = 0.2
     decoder_weight = 1.0
 
-    def eval_ranking_loss(dataset, ranking_dataset):
-        """
-        Validációs loss ugyanazzal a kombinált célfüggvénnyel, mint a
-        tanítás (encoder_loss + matching_ranking_loss), gradient nélkül.
-        """
-        enc.eval()
-        dec.eval()
-        total = 0.0
-        count = 0
-        with torch.no_grad():
-            for graph, ranking_data in zip(dataset, ranking_dataset):
-                edge_attr = graph.edge_attr.float()
-                if edge_attr.ndim == 1:
-                    edge_attr = edge_attr.unsqueeze(-1)
-
-                out = enc(
-                    x=graph.x.float(),
-                    edge_index=graph.edge_index,
-                    edge_attr=edge_attr,
-                )
-                directed_logits = dec(build_decoder_input(out))
-
-                loss_enc, _ = encoder_loss(out=out, batch=graph)
-                loss_dec, _, _ = matching_ranking_loss(
-                    directed_logits=directed_logits,
-                    ranking_data=ranking_data,
-                    temperature=1.0,
-                    score_reg_weight=1e-4,
-                )
-                loss = (
-                    encoder_weight * loss_enc
-                    + decoder_weight * loss_dec
-                )
-                total += loss.item()
-                count += 1
-        return total / max(count, 1)
-
-    # Early stopping a validációs ranking-loss alapján.
-    ranking_patience = 15
-    ranking_min_delta = 1e-4
-    best_ranking_val = float("inf")
-    ranking_bad_checks = 0
-    best_ranking_epoch = -1
 
     if training:
         for epoch in range(10):
@@ -2614,6 +2462,15 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
     marriage_good = 0
     marriage_bad = 0
 
+    # Teljes (complete) párosítás számlálás: a dekódolt megoldásban minden
+    # node párosítva van-e (nincs -1 partner). Típusonként külön is.
+    complete_count = 0           # ebből teljes párosítású
+    complete_total = 0           # összes kiértékelt gráf
+    roommate_complete = 0
+    roommate_complete_total = 0
+    marriage_complete = 0
+    marriage_complete_total = 0
+
     # Méret szerinti bontás. Kulcs: (típus, agent_count), érték:
     # [stabil, összes]. A "méret" a résztvevők (agent) száma:
     #   - házasság (marriage): num_nodes // 2 fő oldalanként,
@@ -2638,6 +2495,12 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
     stability_by_size = defaultdict(
         lambda: {lvl: 0 for lvl in stability_levels}
     )
+
+    # Hány gráfra írjunk RÉSZLETES stabilitás-minősítő debug printet.
+    # (Az egész val-setre túl sok lenne; az első pár gráf elég az
+    # ellenőrzéshez.) Állítsd 0-ra a kikapcsoláshoz, nagyobbra többért.
+    STABILITY_DEBUG_GRAPHS = 3
+    stability_debug_done = 0
 
     for graph in val_data:
         enc.eval()
@@ -2665,6 +2528,22 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
             num_nodes=graph.x.size(0),
             debug=False,
         )
+
+        # Teljes párosítás ellenőrzése: a dekódolt megoldás AKKOR teljes,
+        # ha minden node párt kapott (nincs -1 partner). A greedy dekóder
+        # feasibilitást garantál, de teljességet nem, ezért külön nézzük.
+        is_complete = bool((partner != -1).all().item())
+        complete_total += 1
+        if is_complete:
+            complete_count += 1
+        if graph_is_roommate:
+            roommate_complete_total += 1
+            if is_complete:
+                roommate_complete += 1
+        else:
+            marriage_complete_total += 1
+            if is_complete:
+                marriage_complete += 1
         ranks = preference_lists_to_edge_ranks(
             graph.proposee_pref | graph.proposer_pref,
             graph.edge_index,
@@ -2680,11 +2559,23 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         # (super > strong > weak > unstable) az SRT holtversenyes
         # definíciók szerint. A "weak" megegyezik azzal, hogy nincs
         # (gyenge) blokkoló pár, azaz is_stable igaz.
+        do_stability_debug = stability_debug_done < STABILITY_DEBUG_GRAPHS
+        if do_stability_debug:
+            print(
+                f"\n######## Stabilitás-minősítés debug "
+                f"(gráf #{stability_debug_done + 1}/"
+                f"{STABILITY_DEBUG_GRAPHS}, "
+                f"típus={'roommate' if graph_is_roommate else 'marriage'}, "
+                f"node-ok={int(graph.num_nodes)}) ########"
+            )
         level = classify_stability_level(
             edge_index=graph.edge_index,
             edge_ranks=ranks,
             partner=partner,
+            debug=do_stability_debug,
         )
+        if do_stability_debug:
+            stability_debug_done += 1
         is_stable = level != "unstable"  # = gyengén stabil (nincs weak-blokk)
 
         if is_stable:
@@ -2738,6 +2629,30 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         print("Nincs kiértékelhető gráf (minden gráf kihagyva).")
     if good + bad > 0:
         print(good/(good+bad))
+
+    # --- Teljes párosítás (complete matching) arány ---
+    # Hány dekódolt megoldás volt teljes (minden node párt kapott),
+    # összességében és típusonként.
+    print("--- Teljes párosítás (complete matching) ---")
+    if complete_total > 0:
+        print(
+            f"  Összesített: {complete_count / complete_total:.4f} "
+            f"({complete_count}/{complete_total})"
+        )
+    else:
+        print("  Nincs kiértékelt gráf.")
+    if roommate_complete_total > 0:
+        print(
+            f"  Szobatárs (roommate): "
+            f"{roommate_complete / roommate_complete_total:.4f} "
+            f"({roommate_complete}/{roommate_complete_total})"
+        )
+    if marriage_complete_total > 0:
+        print(
+            f"  Házassági (marriage): "
+            f"{marriage_complete / marriage_complete_total:.4f} "
+            f"({marriage_complete}/{marriage_complete_total})"
+        )
 
     # Típusonkénti bontás: hány szobatárs / házassági problémát néztünk,
     # és mekkora volt a stabilitási arány (pontosság) külön-külön.
@@ -2870,172 +2785,7 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
                 f"super={super_r:.3f} | strong={strong_r:.3f} | "
                 f"weak={weak_r:.3f}"
             )
-    print(val_data[0].prefs)
     print("finished")
-
-    # A teljes-matching rangsoroló kiértékelés (rank_all_complete_matchings)
-    # kizárólag páros gráfokra készült (left/right oldal). Szobatárs esetben
-    # a fenti blocking-count alapú kiértékelés adja a stabilitási metrikát,
-    # így itt kilépünk. Kevert adathalmaznál is kilépünk, mert a lenti rész
-    # fix left/right felosztást feltételez, ami szobatárs-gráfokra érvénytelen.
-    if roommate or mixed:
-        return
-
-    enc.eval()
-    dec.eval()
-
-    evaluated = 0
-    no_complete_matching = 0
-    no_stable_complete_matching = 0
-
-    top1_stable = 0
-    best_stable_ranks = []
-
-    for graph in val_data:
-        with torch.no_grad():
-            edge_attr = graph.edge_attr.float()
-
-            if edge_attr.ndim == 1:
-                edge_attr = edge_attr.unsqueeze(-1)
-
-            out = enc(
-                x=graph.x.float(),
-                edge_index=graph.edge_index,
-                edge_attr=edge_attr,
-            )
-
-            directed_logits = dec(build_decoder_input(out))
-
-        edge_ranks = preference_lists_to_edge_ranks(
-            graph.proposee_pref | graph.proposer_pref,
-            graph.edge_index,
-        )
-
-        results = rank_all_complete_matchings(
-            edge_index=graph.edge_index,
-            directed_logits=directed_logits,
-            edge_ranks=edge_ranks,
-            num_nodes=graph.num_nodes,
-            left_nodes=[0, 1, 2],
-            right_nodes=[3, 4, 5],
-        )
-
-        if not results:
-            no_complete_matching += 1
-            continue
-
-        evaluated += 1
-        top1_stable += int(results[0].is_stable)
-
-        stable_ranks = [
-            result.rank
-            for result in results
-            if result.is_stable
-        ]
-
-        if stable_ranks:
-            best_stable_ranks.append(stable_ranks[0])
-        else:
-            no_stable_complete_matching += 1
-
-    def print_matching_ranking(results: list[RankedMatching]):
-        if not results:
-            print("Nincs megengedett teljes matching.")
-            return
-
-        print("\nMatchingek össz-score szerint:")
-
-        for result in results:
-            print(
-                f"rank={result.rank} | "
-                f"score={result.score:+.6f} | "
-                f"stable={result.is_stable} | "
-                f"blocking_count={len(result.blocking_pairs)} | "
-                f"pairs={result.pairs}"
-            )
-
-        stable_ranks = [
-            result.rank
-            for result in results
-            if result.is_stable
-        ]
-
-        print("\nLegmagasabb score-ú matching:")
-        print(results[0].pairs)
-        print("Stabil:", results[0].is_stable)
-
-        print("Stabil matchingek ranghelyei:", stable_ranks)
-        print(
-            "Legjobb stabil matching ranghelye:",
-            stable_ranks[0] if stable_ranks else None,
-        )
-
-    enc.eval()
-    dec.eval()
-
-    graph = val_data[0]
-
-    with torch.no_grad():
-        edge_attr = graph.edge_attr.float()
-
-        if edge_attr.ndim == 1:
-            edge_attr = edge_attr.unsqueeze(-1)
-
-        out = enc(
-            x=graph.x.float(),
-            edge_index=graph.edge_index,
-            edge_attr=edge_attr,
-        )
-
-        directed_logits = dec(build_decoder_input(out))
-
-    # Az eredeti preferenciákból képzett rankek.
-    # Ne mutual-quality feature-t adj a checkernek.
-    edge_ranks = preference_lists_to_edge_ranks(
-        graph.proposee_pref | graph.proposer_pref,
-        graph.edge_index,
-    )
-
-    results = rank_all_complete_matchings(
-        edge_index=graph.edge_index,
-        directed_logits=directed_logits,
-        edge_ranks=edge_ranks,
-        num_nodes=graph.num_nodes,
-        left_nodes=[0, 1, 2],
-        right_nodes=[3, 4, 5],
-    )
-
-    print_matching_ranking(results)
-    print("Kiértékelt gráfok:", evaluated)
-    print("Teljes matching nélküli gráfok:", no_complete_matching)
-    print(
-        "Stabil teljes matching nélküli gráfok:",
-        no_stable_complete_matching,
-    )
-
-    if evaluated > 0:
-        print(
-            "Legmagasabb score-ú matching stabilitási aránya:",
-            top1_stable / evaluated,
-        )
-
-        print(
-            "Legjobb stabil matching rangeloszlása:",
-            dict(sorted(Counter(best_stable_ranks).items())),
-        )
-
-        # Jelöltlista-lefedettség, nem automatikus solver-pontosság.
-        for k in [1, 2, 3, 6]:
-            contains_stable = sum(
-                rank <= k
-                for rank in best_stable_ranks
-            )
-
-            print(
-                f"Top-{k} között van stabil matching: "
-                f"{contains_stable / evaluated:.3f}"
-            )
-
 
 if __name__ == "__main__":
     training = False
