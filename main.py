@@ -2027,7 +2027,7 @@ ROOMMATE_DISTRIBUTIONS = {
 
 def get_or_generate_roommate_test_dataset(
     distribution,
-    group_sizes=(6, 8, 10, 12),
+    group_sizes=(6, 8, 10, 12,14,16,18,20,22,24,26,28,30),
     n_train=1000,
     n_val=500,
     allow_ties=True,
@@ -2280,7 +2280,7 @@ def prepare_dataset_ranking(
 
 def main(training=False, roommate=True, mixed=False, allow_ties=False):
 
-    group_size=3
+    group_size=5
 
     if mixed:
         # 50/50 keverék: szobatárs (roommate) és házassági (marriage)
@@ -2322,7 +2322,7 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         )
         """
         train_data, val_data = get_or_generate_roommate_test_dataset(
-            "normal", allow_ties=True, n_val=500,
+            "top_ties", allow_ties=True, n_val=1000,
         )
     else:
         # Páros (bipartite) eset: generate_graph_m bázisgráf.
@@ -2499,7 +2499,7 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
     # Hány gráfra írjunk RÉSZLETES stabilitás-minősítő debug printet.
     # (Az egész val-setre túl sok lenne; az első pár gráf elég az
     # ellenőrzéshez.) Állítsd 0-ra a kikapcsoláshoz, nagyobbra többért.
-    STABILITY_DEBUG_GRAPHS = 3
+    STABILITY_DEBUG_GRAPHS = 0
     stability_debug_done = 0
 
     for graph in val_data:
@@ -2627,8 +2627,6 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
               sum(c == 0 for c in counts) / len(counts))
     else:
         print("Nincs kiértékelhető gráf (minden gráf kihagyva).")
-    if good + bad > 0:
-        print(good/(good+bad))
 
     # --- Teljes párosítás (complete matching) arány ---
     # Hány dekódolt megoldás volt teljes (minden node párt kapott),
@@ -2721,39 +2719,6 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
             f"({marriage_good}/{marriage_total})"
         )
 
-    # --- Méret szerinti kiértékelés ---
-    # Megmutatja, hogy a modell mekkora problémákon mennyire pontos.
-    #   - Az ÖSSZESÍTETT bontás kulcsa a node-szám (num_nodes), ez közös,
-    #     egyértelmű skála mindkét típusra.
-    #   - A típusonkénti bontásnál a "size" a résztvevők természetes
-    #     létszáma: házasságnál oldalanként (num_nodes/2), szobatársnál a
-    #     teljes létszám (num_nodes).
-    print("--- Méret szerinti kiértékelés (stabilitási arány) ---")
-
-    print("Összesített, node-szám szerint (típustól függetlenül):")
-    for n_nodes in sorted(size_stats_overall):
-        stable, total = size_stats_overall[n_nodes]
-        if total > 0:
-            print(
-                f"  node={n_nodes:>3}: {stable / total:.4f} "
-                f"({stable}/{total})"
-            )
-
-    for type_name, type_label, unit in (
-        ("marriage", "Házassági (marriage)", "oldalankénti létszám"),
-        ("roommate", "Szobatárs (roommate)", "teljes létszám"),
-    ):
-        sizes = sorted(s for (t, s) in size_stats if t == type_name)
-        if not sizes:
-            continue
-        print(f"{type_label} méret szerint ({unit}):")
-        for size in sizes:
-            stable, total = size_stats[(type_name, size)]
-            if total > 0:
-                print(
-                    f"  méret={size:>3}: {stable / total:.4f} "
-                    f"({stable}/{total})"
-                )
 
     # --- Stabilitási szintek méret szerint ---
     # Kumulatív arányok (super <= strong <= weak) méretenként, hogy
