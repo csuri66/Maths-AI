@@ -1,5 +1,6 @@
 import ast
 import os
+import copy
 import data_generator
 import random
 import encoder
@@ -17,7 +18,27 @@ import random
 # A preferencia-reprezentáció verziója. A szobatárs (roommate) gráfok
 # mostantól HOLTVERSENYES (réteges) preferenciákat használnak, ezért a
 # régi (holtverseny nélküli) cache-eket érvénytelenítjük ezzel a kulccsal.
-PREF_FORMAT_VERSION = "roommate_ties_v1"
+#
+# v2: a "legjobb helyre sorolás" node-embedding (feature index 0) mostantól
+# SZÁZALÉK (hány % másik csomópont teszi az adott csomópontot az első helyre),
+# a korábbi NYERS DARABSZÁM helyett. A régi (összegző) cache-eket ezzel a
+# verzióemeléssel érvénytelenítjük, hogy a roommate adathalmazok (tied és
+# nontied is) újragenerálódjanak az új százalékos embeddinggel.
+#
+# v3: a "rang-összeg" node-embedding (feature index 1) mostantól SKÁLÁZOTT
+# rangok összege: a rangsoroló csomópont legjobb rangja -> 0, legrosszabb
+# rangja -> 1, a köztes rangok lineárisan skálázva; e 0..1 értékek összege
+# az embedding. Korábban a NYERS (réteg index + 1) rangokat összegeztük.
+#
+# v4: a "legrosszabb helyre sorolás" node-embedding (feature index 2)
+# mostantól NEGATÍV SZÁZALÉK (hány % másik csomópont teszi az adott
+# csomópontot az utolsó/legrosszabb helyre, -1-gyel szorozva), a korábbi
+# NYERS NEGATÍV DARABSZÁM helyett.
+#
+# v5: a "medián rang" node-embedding (feature index 3) mostantól a
+# SKÁLÁZOTT rangok (best=0, worst=1, lineárisan skálázva) MEDIÁNJA, a
+# korábbi NYERS rang-medián helyett.
+PREF_FORMAT_VERSION = "roommate_ties_v6"
 
 
 def best_pairing_for_selected_node(
@@ -536,6 +557,441 @@ def proposed_from_is_held(proposed_from, x):
         if who == x:
             return True
     return False
+
+
+def _build_directed_score_map(
+    edge_index: torch.Tensor,
+    directed_logits: torch.Tensor,
+) -> Dict[Tuple[int, int], float]:
+    """
+    Irányított él-score térkép a decoder nyers logitjaiból.
+
+    edge_index: [2, E], edge_index[:, e] = [u, v] az u -> v él.
+    directed_logits: [E], a decoder nyers logitja az adott irányított élre.
+
+    Visszatér: {(u, v): score} dict. Duplikált él esetén a NAGYOBB score-t
+    tartjuk meg (ugyanaz a konvenció, mint a greedy dekódernél).
+    """
+    src = edge_index[0].detach().cpu().tolist()
+    dst = edge_index[1].detach().cpu().tolist()
+    logits = directed_logits.detach().cpu().view(-1).tolist()
+
+    score: Dict[Tuple[int, int], float] = {}
+    for u, v, s in zip(src, dst, logits):
+        if u == v:
+            continue
+        s = float(s)
+        if (u, v) not in score or s > score[(u, v)]:
+            score[(u, v)] = s
+    return score
+
+
+def _model_broken_prefs(
+    nodes,
+    tiered_prefs,
+    directed_score: Dict[Tuple[int, int], float],
+    attempt: int = 0,
+):
+    """
+    Réteges (holtversenyes) preferenciákat SZIGORÚ (holtverseny nélküli)
+    listává alakít úgy, hogy a HOLTVERSENYEKET A MODELL PREDIKCIÓJA bontja.
+
+    Minden `x` node-ra:
+      - a rétegeket a legjobbtól a legrosszabbig vesszük (a réteg-sorrend a
+        valódi preferencia, ezt NEM írjuk felül);
+      - EGY rétegen belül (ahol holtverseny van) a partnereket az
+        x -> partner irányított él modell-score-ja szerint CSÖKKENŐ
+        sorrendbe rakjuk: nagyobb score = x jobban preferálja.
+        Így a tie-break a modell tanult preferenciáját követi.
+
+    attempt:
+        A tie-break VARIÁNS indexe (0 = a legjobb, score szerint csökkenő
+        alap-sorrend). `attempt > 0` esetén UGYANCSAK score-alapú, de MÁS
+        sorrendet ad: a holtversenyes rétegen belül a score szerinti
+        `attempt`-edik (0-indexelt) jelöltet emeli a réteg ÉLÉRE, a többit
+        a score-sorrendben hagyva. Így `attempt=1` a "második legjobb"-at
+        választja elöl, `attempt=2` a harmadikat, stb. Ez determinisztikus,
+        kizárólag a modell score-jaiból számított, az alaptól ELTÉRŐ
+        megközelítés (nem véletlen). Ha egy réteg rövidebb, mint az
+        `attempt+1`, a réteg változatlan marad (nincs mit előrébb hozni).
+
+    Ha egy listához nincs réteges forma (sima lista), érintetlenül
+    lapítjuk (nincs holtverseny, nincs mit bontani).
+
+    Visszatér: {x: [partner, ...]} szigorú (best->worst) listák.
+    """
+    strict = {}
+    for x in nodes:
+        pref_list = tiered_prefs.get(x, [])
+
+        if not data_generator._is_tiered(pref_list):
+            # Sima lista: nincs holtverseny, csak másolat.
+            strict[x] = list(pref_list)
+            continue
+
+        flat = []
+        for tier in pref_list:
+            # Egy réteg tagjait a modell x -> tag score-ja szerint
+            # csökkenő sorrendbe rakjuk. Hiányzó score esetén -inf
+            # (a réteg végére kerül), stabil másodlagos kulcs a node-id.
+            ordered = sorted(
+                tier,
+                key=lambda partner: (
+                    directed_score.get((x, partner), float("-inf")),
+                    -partner,
+                ),
+                reverse=True,
+            )
+
+            # attempt > 0: a score szerinti `attempt`-edik jelöltet a réteg
+            # élére emeljük (score-alapú "második/harmadik ... legjobb"
+            # megközelítés), a többi score-sorrend megmarad. Ha a réteg
+            # túl rövid, nincs változás.
+            if attempt > 0 and len(ordered) > attempt:
+                promoted = ordered.pop(attempt)
+                ordered.insert(0, promoted)
+
+            flat.extend(ordered)
+        strict[x] = flat
+    return strict
+
+
+def irving_srt_decode_pairs(
+    edge_index: torch.Tensor,
+    directed_logits: torch.Tensor,
+    num_nodes: int,
+    preferences: Dict[int, list],
+    max_attempts: int = 10,
+    debug: bool = False,
+) -> torch.Tensor:
+    """
+    SRT (holtversenyes stabil szobatárs) dekóder IRVING algoritmussal,
+    ahol a HOLTVERSENYEKET A MODELL PREDIKCIÓJA bontja.
+
+    A klasszikus Irving-algoritmus SZIGORÚ preferenciákat vár. Az SRT
+    (Stable Roommates with Ties) esetben a preferenciák rétegesek
+    (holtversenyesek). A szokásos megközelítés a holtversenyek tetszőleges
+    "szigorúsítása" (tie-break), majd a klasszikus Irving futtatása: egy
+    így kapott stabil párosítás az eredeti holtversenyes instanciában
+    GYENGÉN stabil.
+
+    Itt a tetszőleges tie-break HELYETT a modell által jósolt él-score-okat
+    használjuk: egy holtversenyes rétegen belül azt a partnert soroljuk
+    előrébb, amelyikre a modell nagyobb score-t ad. Így a tie-break a
+    tanult preferenciát követi, nem véletlen/fix sorrendet.
+
+    FALLBACK LOGIKA (két szint):
+      1) Ha az alap (attempt=0) tie-break szerint NEM kapunk GYENGÉN STABIL
+         párosítást (az Irving None-t ad, VAGY a kapott párosítás nem
+         gyengén stabil), akkor ÚJRA próbáljuk MÁS, de SZINTÉN
+         score-alapú megközelítéssel (lásd `_model_broken_prefs` `attempt`
+         paramétere: a score szerinti második/harmadik/... legjobb jelöltet
+         emeljük a réteg élére). Összesen `max_attempts` (alapból 10)
+         különböző megközelítést próbálunk; amint gyengén stabilat találunk,
+         MEGÁLLUNK és azt adjuk vissza.
+      2) Ha `max_attempts` próbálkozás UTÁN sincs gyengén stabil megoldás,
+         a GREEDY dekóderre (`greedy_decode_pairs`) esünk vissza.
+
+    A "gyengén stabil" ellenőrzés a `classify_stability_level(...) !=
+    "unstable"` feltétellel történik (nincs weak-blokkoló pár), ugyanúgy,
+    ahogy a kiértékelés is méri.
+
+    Input
+    -----
+    edge_index:
+        [2, E], edge_index[:, e] = [u, v] az u -> v él.
+    directed_logits:
+        [E], a decoder nyers logitja (a tie-break-hez és a megengedett
+        párok meghatározásához).
+    num_nodes:
+        Node-ok száma.
+    preferences:
+        {node: réteges_vagy_sima_pref_lista}. Jellemzően
+        `graph.proposee_pref | graph.proposer_pref`.
+    max_attempts:
+        Hány KÜLÖNBÖZŐ score-alapú tie-break megközelítést próbáljunk, mielőtt
+        a greedy dekóderre esnénk vissza (alapból 10).
+
+    Output
+    ------
+    partner:
+        [num_nodes], partner[u] = v vagy -1.
+    """
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError(
+            "edge_index shape-ja [2, E] legyen, "
+            f"de ezt kaptam: {tuple(edge_index.shape)}"
+        )
+    if directed_logits.ndim != 1:
+        raise ValueError(
+            "directed_logits shape-ja [E] legyen, "
+            f"de ezt kaptam: {tuple(directed_logits.shape)}"
+        )
+    if edge_index.size(1) != directed_logits.numel():
+        raise ValueError(
+            "Eltér az edge_index és directed_logits élszáma: "
+            f"{edge_index.size(1)} vs {directed_logits.numel()}"
+        )
+
+    device = edge_index.device
+
+    directed_score = _build_directed_score_map(edge_index, directed_logits)
+
+    # Megengedett (kölcsönösen elfogadható) párok: azok a canonical {u,v}
+    # párok, amelyekhez MINDKÉT irányított él létezik. Ez megegyezik a
+    # greedy dekóder kölcsönösségi feltételével.
+    allowed_pairs = set()
+    for (u, v) in directed_score.keys():
+        if u < v and (v, u) in directed_score:
+            allowed_pairs.add((u, v))
+
+    nodes = list(range(num_nodes))
+
+    # Él-rangok a GYENGE STABILITÁS ellenőrzéséhez (egyszer számoljuk ki).
+    edge_ranks = preference_lists_to_edge_ranks(preferences, edge_index)
+
+    def to_partner(matching):
+        p = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+        if matching is None:
+            return p
+        for a, b in matching:
+            p[a] = b
+            p[b] = a
+        return p
+
+    def is_weakly_stable(partner_tensor):
+        # Minden node párt kapott-e (teljes párosítás) ÉS nincs weak-blokk.
+        if not bool((partner_tensor != -1).all().item()):
+            return False
+        level = classify_stability_level(
+            edge_index=edge_index,
+            edge_ranks=edge_ranks,
+            partner=partner_tensor,
+            debug=False,
+        )
+        return level != "unstable"
+
+    # --- Több score-alapú tie-break megközelítés kipróbálása ---
+    for attempt in range(max_attempts):
+        strict_prefs = _model_broken_prefs(
+            nodes, preferences, directed_score, attempt=attempt,
+        )
+
+        if debug:
+            tag = "alap" if attempt == 0 else f"{attempt+1}. legjobb elöl"
+            print(f"\n--- Model-guided tie-break próbálkozás "
+                  f"#{attempt} ({tag}) ---")
+            for x in nodes:
+                print(f"  {x}: {strict_prefs.get(x, [])}")
+
+        matching = _irving_stable_roommate(
+            nodes=nodes,
+            prefs=strict_prefs,
+            allowed_pairs=allowed_pairs,
+        )
+        partner = to_partner(matching)
+
+        if is_weakly_stable(partner):
+            if debug:
+                print(f"Gyengén stabil párosítás a #{attempt} "
+                      f"próbálkozással: {matching}")
+            return partner
+        elif debug:
+            reason = ("Irving None" if matching is None
+                      else "nem gyengén stabil")
+            print(f"  #{attempt} próbálkozás SIKERTELEN ({reason}).")
+
+    # --- Fallback: greedy dekóder ---
+    if debug:
+        print(f"{max_attempts} score-alapú próbálkozás UTÁN sincs gyengén "
+              f"stabil megoldás -> GREEDY fallback.")
+    return greedy_decode_pairs(
+        edge_index=edge_index,
+        directed_logits=directed_logits,
+        num_nodes=num_nodes,
+        debug=False,
+    )
+
+
+def _random_broken_prefs(nodes, tiered_prefs, rng=None):
+    """
+    Réteges (holtversenyes) preferenciákat SZIGORÚ (holtverseny nélküli)
+    listává alakít úgy, hogy a HOLTVERSENYEKET VÉLETLENSZERŰEN bontja.
+
+    Minden `x` node-ra:
+      - a rétegeket a legjobbtól a legrosszabbig vesszük (a réteg-sorrend a
+        valódi preferencia, ezt NEM írjuk felül);
+      - EGY rétegen belül (ahol holtverseny van) a partnereket VÉLETLEN
+        sorrendbe keverjük (uniform random permutáció).
+
+    Ez a `_model_broken_prefs` baseline párja: minden ugyanaz, KIZÁRÓLAG a
+    tie-break stratégia tér el (modell-score helyett véletlen).
+
+    rng:
+        Opcionális `random.Random` példány a reprodukálható
+        keveréshez. Ha None, a globális `random` modult használjuk.
+
+    Visszatér: {x: [partner, ...]} szigorú (best->worst) listák.
+    """
+    shuffle = (rng.shuffle if rng is not None else random.shuffle)
+
+    strict = {}
+    for x in nodes:
+        pref_list = tiered_prefs.get(x, [])
+
+        if not data_generator._is_tiered(pref_list):
+            # Sima lista: nincs holtverseny, csak másolat.
+            strict[x] = list(pref_list)
+            continue
+
+        flat = []
+        for tier in pref_list:
+            members = list(tier)
+            shuffle(members)
+            flat.extend(members)
+        strict[x] = flat
+    return strict
+
+
+def irving_srt_decode_pairs_random(
+    edge_index: torch.Tensor,
+    directed_logits: torch.Tensor,
+    num_nodes: int,
+    preferences: Dict[int, list],
+    rng=None,
+    max_attempts: int = 10,
+    debug: bool = False,
+) -> torch.Tensor:
+    """
+    SRT dekóder IRVING algoritmussal, ahol a HOLTVERSENYEKET VÉLETLENSZERŰEN
+    bontjuk (baseline az `irving_srt_decode_pairs` modell-vezérelt tie-break
+    ellenében).
+
+    MINDEN ugyanaz, mint az `irving_srt_decode_pairs`-ben (ugyanaz az Irving
+    algoritmus, ugyanaz az `allowed_pairs` kölcsönösségi szűrés a
+    `directed_logits`-ből), KIZÁRÓLAG a tie-break tér el: a holtversenyes
+    rétegeket nem a modell score-ja, hanem egy véletlen permutáció
+    szigorúsítja.
+
+    A `directed_logits` itt is kell: az él létezéséből (mindkét irány) adódó
+    kölcsönös (allowed) párok halmazát innen határozzuk meg, PONTOSAN úgy,
+    ahogy a modell-vezérelt és a greedy dekóder is. Így a két Irving-teszt
+    KIZÁRÓLAG a tie-break-ben különbözik.
+
+    RETRY LOGIKA:
+      Ha az aktuális VÉLETLEN tie-break szerint NEM kapunk GYENGÉN STABIL
+      párosítást, ÚJRA próbáljuk egy MÁSIK VÉLETLEN tie-break-kel. Összesen
+      `max_attempts` (alapból 10) független véletlen próbálkozást teszünk;
+      amint gyengén stabilat találunk, MEGÁLLUNK és azt adjuk vissza.
+
+      A model-vezérelt dekóderrel ELLENTÉTBEN:
+        - a próbálkozások VÉLETLEN alapúak (nem score-alapúak),
+        - a modell score-ját a tie-break-hez NEM használjuk (csak az
+          allowed_pairs meghatározásához, mint eddig),
+        - NINCS greedy fallback: ha `max_attempts` próbálkozás után sincs
+          gyengén stabil megoldás, az UTOLSÓ próbálkozás eredményét adjuk
+          vissza (jellemzően csupa -1 vagy nem gyengén stabil párosítás).
+
+    rng:
+        Opcionális `random.Random` a reprodukálható véletlen tie-break-hez.
+    max_attempts:
+        Hány független VÉLETLEN tie-break próbálkozást teszünk (alapból 10).
+
+    Visszatér: partner tensor [num_nodes] (-1, ahol nincs pár).
+    """
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError(
+            "edge_index shape-ja [2, E] legyen, "
+            f"de ezt kaptam: {tuple(edge_index.shape)}"
+        )
+    if directed_logits.ndim != 1:
+        raise ValueError(
+            "directed_logits shape-ja [E] legyen, "
+            f"de ezt kaptam: {tuple(directed_logits.shape)}"
+        )
+    if edge_index.size(1) != directed_logits.numel():
+        raise ValueError(
+            "Eltér az edge_index és directed_logits élszáma: "
+            f"{edge_index.size(1)} vs {directed_logits.numel()}"
+        )
+
+    device = edge_index.device
+
+    directed_score = _build_directed_score_map(edge_index, directed_logits)
+
+    # Megengedett (kölcsönösen elfogadható) párok: azok a canonical {u,v}
+    # párok, amelyekhez MINDKÉT irányított él létezik. (Ugyanaz, mint a
+    # modell-vezérelt és a greedy dekóderben.)
+    allowed_pairs = set()
+    for (u, v) in directed_score.keys():
+        if u < v and (v, u) in directed_score:
+            allowed_pairs.add((u, v))
+
+    nodes = list(range(num_nodes))
+
+    # Él-rangok a GYENGE STABILITÁS ellenőrzéséhez (egyszer számoljuk ki).
+    edge_ranks = preference_lists_to_edge_ranks(preferences, edge_index)
+
+    def to_partner(matching):
+        p = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+        if matching is None:
+            return p
+        for a, b in matching:
+            p[a] = b
+            p[b] = a
+        return p
+
+    def is_weakly_stable(partner_tensor):
+        # Minden node párt kapott-e (teljes párosítás) ÉS nincs weak-blokk.
+        if not bool((partner_tensor != -1).all().item()):
+            return False
+        level = classify_stability_level(
+            edge_index=edge_index,
+            edge_ranks=edge_ranks,
+            partner=partner_tensor,
+            debug=False,
+        )
+        return level != "unstable"
+
+    # --- Több FÜGGETLEN VÉLETLEN tie-break próbálkozás ---
+    last_partner = torch.full(
+        (num_nodes,), -1, dtype=torch.long, device=device,
+    )
+    for attempt in range(max_attempts):
+        # Minden próbálkozás ÚJ véletlen tie-break (ugyanazt az rng-t
+        # használjuk, így a sorozat reprodukálható, de próbálkozásonként
+        # eltérő permutáció).
+        strict_prefs = _random_broken_prefs(nodes, preferences, rng=rng)
+
+        if debug:
+            print(f"\n--- Random tie-break próbálkozás #{attempt} ---")
+            for x in nodes:
+                print(f"  {x}: {strict_prefs.get(x, [])}")
+
+        matching = _irving_stable_roommate(
+            nodes=nodes,
+            prefs=strict_prefs,
+            allowed_pairs=allowed_pairs,
+        )
+        partner = to_partner(matching)
+        last_partner = partner
+
+        if is_weakly_stable(partner):
+            if debug:
+                print(f"Gyengén stabil párosítás a #{attempt} véletlen "
+                      f"próbálkozással: {matching}")
+            return partner
+        elif debug:
+            reason = ("Irving None" if matching is None
+                      else "nem gyengén stabil")
+            print(f"  #{attempt} próbálkozás SIKERTELEN ({reason}).")
+
+    # NINCS greedy fallback: az utolsó próbálkozás eredményét adjuk vissza.
+    if debug:
+        print(f"{max_attempts} véletlen próbálkozás UTÁN sincs gyengén "
+              f"stabil megoldás -> az utolsó eredmény (nincs greedy "
+              f"fallback).")
+    return last_partner
 
 
 def _random_perfect_matching(nodes, allowed_pairs, max_tries=200):
@@ -2280,7 +2736,7 @@ def prepare_dataset_ranking(
 
 def main(training=False, roommate=True, mixed=False, allow_ties=False):
 
-    group_size=5
+    group_size=3
 
     if mixed:
         # 50/50 keverék: szobatárs (roommate) és házassági (marriage)
@@ -2317,13 +2773,14 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
             n_val=500,
             cache_path="dataset_roommate.pt",
             seed=42,
-            group_sizes=[2 * gs for gs in (3, 4, 5, 6)],
+            group_sizes=[2 * gs for gs in (3, 4, 5, 6,7,8)],
             allow_ties=allow_ties,
         )
         """
         train_data, val_data = get_or_generate_roommate_test_dataset(
-            "top_ties", allow_ties=True, n_val=1000,
+            "normal", allow_ties=True, n_val=1000,
         )
+
     else:
         # Páros (bipartite) eset: generate_graph_m bázisgráf.
         train_data, val_data = get_or_generate_dataset(
@@ -2336,22 +2793,6 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
             seed=42,
         )
 
-    enc = encoder.StableMatchingEdgeEncoder(
-        node_feature_dim=train_data[0].x.shape[1],
-        edge_feature_dim=1,
-        hidden_dim=32,
-        num_layers=6,
-    )
-    dec = decoder.GreedyMatchingDecoder(
-        edge_embedding_dim=34,
-        hidden_dim=34,
-    )
-
-    optimizer_joint = torch.optim.AdamW(
-        list(enc.parameters()) + list(dec.parameters()),
-        lr=3e-4,
-        weight_decay=1e-4,
-    )
     # Páros esetben a bal/jobb oldali node-ok a group_size-ból adódnak;
     # szobatárs esetben nincs oldal-felosztás (a ranking-prep figyelmen
     # kívül hagyja a left/right argumentumokat).
@@ -2366,12 +2807,96 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
         mixed=mixed,
     )
 
+    # A validációs (korai leállításhoz / modellválasztáshoz használt)
+    # halmaz ranking-előkészítése, ugyanazzal a konfigurációval, mint a
+    # tanító halmaz.
+    val_ranking = prepare_dataset_ranking(
+        val_data,
+        left_nodes,
+        right_nodes,
+        roommate=roommate,
+        mixed=mixed,
+    )
+
     encoder_weight = 0.2
     decoder_weight = 1.0
 
+    node_feature_dim = train_data[0].x.shape[1]
 
-    if training:
-        for epoch in range(10):
+    def build_models():
+        """Friss (véletlen inicializált) encoder+decoder+optimizer egy
+        tanítási futáshoz."""
+        enc = encoder.StableMatchingEdgeEncoder(
+            node_feature_dim=node_feature_dim,
+            edge_feature_dim=1,
+            hidden_dim=32,
+            num_layers=6,
+        )
+        dec = decoder.GreedyMatchingDecoder(
+            edge_embedding_dim=34,
+            hidden_dim=34,
+        )
+        optimizer_joint = torch.optim.AdamW(
+            list(enc.parameters()) + list(dec.parameters()),
+            lr=3e-4,
+            weight_decay=1e-4,
+        )
+        return enc, dec, optimizer_joint
+
+    def evaluate_val_loss(enc, dec, temperature):
+        """A validációs össz-loss (gradiens nélkül, eval módban) az adott
+        hőmérséklettel. Ugyanazt a súlyozott loss-t használja, mint a
+        tanítás, így a korai leállítás és a modellválasztás a tanítási
+        célt tükröző metrikán alapul."""
+        enc.eval()
+        dec.eval()
+        total = 0.0
+        with torch.no_grad():
+            for gid in range(len(val_data)):
+                graph = val_data[gid]
+                ranking_data = val_ranking[gid]
+
+                edge_attr = graph.edge_attr.float()
+                if edge_attr.ndim == 1:
+                    edge_attr = edge_attr.unsqueeze(-1)
+
+                out = enc(
+                    x=graph.x.float(),
+                    edge_index=graph.edge_index,
+                    edge_attr=edge_attr,
+                )
+                directed_logits = dec(build_decoder_input(out))
+
+                loss_enc, _ = encoder_loss(out=out, batch=graph)
+                loss_dec, _, _ = matching_ranking_loss(
+                    directed_logits=directed_logits,
+                    ranking_data=ranking_data,
+                    temperature=temperature,
+                    score_reg_weight=1e-4,
+                )
+                loss = encoder_weight * loss_enc + decoder_weight * loss_dec
+                total += loss.item()
+        n = max(len(val_data), 1)
+        return total / n
+
+    def train_one_run(temperature, max_epochs=100, patience=5, min_delta=1e-3):
+        """EGY teljes tanítási futás KORAI LEÁLLÍTÁSSAL az adott
+        hőmérséklettel. Friss modellt épít, a validációs loss alapján
+        early-stoppol, és a futás LEGJOBB (legkisebb val-loss-ú) modell-
+        állapotát adja vissza.
+
+        Visszatérés: (best_val_loss, best_enc_state, best_dec_state,
+        best_epoch).
+        """
+        enc, dec, optimizer_joint = build_models()
+
+        best_val_loss = float("inf")
+        best_epoch = -1
+        epochs_without_improvement = 0
+        best_enc_state = copy.deepcopy(enc.state_dict())
+        best_dec_state = copy.deepcopy(dec.state_dict())
+
+        for epoch in range(max_epochs):
             enc.train()
             dec.train()
 
@@ -2408,7 +2933,7 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
                 loss_dec, metrics, _ = matching_ranking_loss(
                     directed_logits=directed_logits,
                     ranking_data=ranking_data,
-                    temperature=1.0,
+                    temperature=temperature,
                     score_reg_weight=1e-4,
                 )
 
@@ -2432,18 +2957,68 @@ def main(training=False, roommate=True, mixed=False, allow_ties=False):
 
             count = len(train_data)
 
+            # Validációs loss az epoch végén (korai leállításhoz) UGYANAZZAL
+            # a hőmérséklettel, amivel a futás tanul.
+            val_loss = evaluate_val_loss(enc, dec, temperature)
+
             print(
-                f"epoch={epoch} | "
+                f"temp={temperature:.1f} | epoch={epoch} | "
                 f"train_total={total_loss / count:.6f} | "
                 f"train_enc={total_encoder_loss / count:.6f} | "
-                f"train_rank={total_rank_loss / count:.6f}"
+                f"train_rank={total_rank_loss / count:.6f} | "
+                f"val_total={val_loss:.6f}"
             )
 
-        # A tanítási epochok után elmentjük az encoder és decoder
-        # súlyait, hogy később visszatölthetők legyenek.
+            # Javulás-e a legjobb eddigi val-loss-hoz képest?
+            if val_loss < best_val_loss - min_delta:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                best_enc_state = copy.deepcopy(enc.state_dict())
+                best_dec_state = copy.deepcopy(dec.state_dict())
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    print(
+                        f"temp={temperature:.1f} | Korai leállítás: "
+                        f"{patience} epoch óta nincs javulás a validációs "
+                        f"loss-ban. Legjobb epoch={best_epoch}, "
+                        f"val_total={best_val_loss:.6f}."
+                    )
+                    break
+
+        return best_val_loss, best_enc_state, best_dec_state, best_epoch
+
+    if training:
+        # Egyetlen TELJES tanítási futás KORAI LEÁLLÍTÁSSAL (temperature=1.0).
+        # A futás a validációs loss alapján early-stoppol, és a LEGJOBB
+        # (legkisebb val-loss-ú) modell-állapotot tartjuk meg.
+        temperature = 1.0
+
+        best_val_loss, best_enc_state, best_dec_state, best_epoch = (
+            train_one_run(temperature)
+        )
+
+        # A LEGJOBB (validáción legkisebb loss-ú) súlyok visszatöltése,
+        # hogy az elmentett modell a korai leállítás szerinti legjobb
+        # állapot legyen.
+        enc, dec, optimizer_joint = build_models()
+        enc.load_state_dict(best_enc_state)
+        dec.load_state_dict(best_dec_state)
+        print(
+            f"Legjobb modell visszatöltve (epoch={best_epoch}, "
+            f"val_total={best_val_loss:.6f})."
+        )
+
+        # A legjobb encoder és decoder súlyok mentése, hogy később
+        # visszatölthetők legyenek.
         torch.save(enc.state_dict(), "enc.pt")
         torch.save(dec.state_dict(), "dec.pt")
         print("Encoder és decoder modellek elmentve: enc.pt, dec.pt")
+    else:
+        # Nem-tanító mód: üres modellek, amelyeket a kiértékeléshez
+        # lemezről töltünk be (lásd lentebb).
+        enc, dec, optimizer_joint = build_models()
 
 
 
@@ -2756,8 +3331,5 @@ if __name__ == "__main__":
     training = False
     roommate = True
     mixed = False
-    # Holtverseny (ties) a szobatárs preferenciákban. False = a régi,
-    # holtverseny nélküli adattal fut (csak a reprezentáció réteges),
-    # True = valódi holtversenyes preferenciák.
-    allow_ties = True
+    allow_ties =  True
     main(training, roommate, mixed, allow_ties)

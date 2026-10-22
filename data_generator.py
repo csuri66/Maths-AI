@@ -514,6 +514,7 @@ def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False, score_fn=None):
             data_x[who_am_i].append(0)
 
         ranks = []
+        others_count = 0  # hány másik csomópont rangsorolja `node`-ot
         for node_ in nodes:
             if node_ == node:
                 continue
@@ -522,15 +523,44 @@ def graph_to_pyg_data_r_normal(G, group_size, allow_ties=False, score_fn=None):
             best_rank = 0
             worst_rank = len(other_pref) - 1  # utolsó réteg indexe
             r = other_rank_of[node]
-            # Hányan tartják `node`-ot a LEGJOBB rétegükben.
+            others_count += 1
+            # Hányan tartják `node`-ot a LEGJOBB rétegükben (nyers szám,
+            # a ciklus után százalékra alakítjuk).
             if r == best_rank:
                 data_x[who_am_i][0] += 1
-            # Hányan tartják `node`-ot a LEGROSSZABB rétegükben.
+            # Hányan tartják `node`-ot a LEGROSSZABB rétegükben (nyers
+            # szám, a ciklus után százalékra alakítjuk).
             if r == worst_rank:
-                data_x[who_am_i][2] -= 1
-            # Rang-összeg (réteg index + 1).
-            data_x[who_am_i][1] += r + 1
-            ranks.append(r)
+                data_x[who_am_i][2] += 1
+            # Rang-összeg SKÁLÁZOTT rangokból: az adott rangsoroló
+            # csomópont LEGJOBB rangja -> 0, LEGROSSZABB rangja -> 1,
+            # a köztes rangokat lineárisan skálázzuk (r / worst_rank),
+            # majd ezeket a 0..1 közötti értékeket összegezzük. Ha csak
+            # egyetlen lehetséges rang van (worst_rank == 0, azaz egyetlen
+            # réteg), akkor a skálázott rang 0.
+            if worst_rank > best_rank:
+                scaled_rank = (r - best_rank) / (worst_rank - best_rank)
+            else:
+                scaled_rank = 0.0
+            data_x[who_am_i][1] += scaled_rank
+            # A MEDIÁN embedding is a SKÁLÁZOTT rangokból számol (best=0,
+            # worst=1), ezért a skálázott értéket gyűjtjük.
+            ranks.append(scaled_rank)
+        # A LEGJOBB helyre sorolás embeddingje SZÁZALÉK: a csomópontot az
+        # első (legjobb) helyre tevő csomópontok ARÁNYA az összes másik
+        # csomóponthoz képest (0..100).
+        if others_count > 0:
+            data_x[who_am_i][0] = 100.0 * data_x[who_am_i][0] / others_count
+        else:
+            data_x[who_am_i][0] = 0.0
+        # A LEGROSSZABB helyre sorolás embeddingje NEGATÍV SZÁZALÉK: a
+        # csomópontot az utolsó (legrosszabb) rétegbe tevő csomópontok
+        # ARÁNYA az összes másik csomóponthoz képest, -1-gyel szorozva
+        # (-100..0).
+        if others_count > 0:
+            data_x[who_am_i][2] = -100.0 * data_x[who_am_i][2] / others_count
+        else:
+            data_x[who_am_i][2] = 0.0
         ranks.sort()
         data_x[who_am_i][3] = statistics.median(ranks)
         who_am_i += 1
