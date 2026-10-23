@@ -22,6 +22,7 @@ hívásával indíthatók.
 
 from __future__ import annotations
 
+import time
 from collections import Counter, defaultdict
 
 import torch
@@ -35,7 +36,7 @@ DEC_WEIGHTS_PATH = "dec.pt"
 
 # Az összehasonlításhoz használt szobatárs (roommate) eloszlás és méret.
 # Ugyanaz, amit a main() is használ a kiértékeléshez.
-DISTRIBUTION = "normal"
+DISTRIBUTION = "top_ties"
 GROUP_SIZE = 3
 
 # CSAK ilyen méretű (ennyi AGENT = ennyi NODE) gráfokon tesztelünk.
@@ -158,6 +159,9 @@ def evaluate_decoder(enc, dec, val_data, decode_fn, label):
 
     skipped = 0
 
+    # A gráfonkénti (dekódolási) megoldási idők gyűjtése.
+    solve_times = []
+
     for graph in val_data:
         # BIZTONSÁGI szűrő: csak AGENT_COUNT (=100) node-ú gráfokat
         # értékelünk. Szobatárs esetben az agentek száma = node-ok száma.
@@ -169,7 +173,10 @@ def evaluate_decoder(enc, dec, val_data, decode_fn, label):
 
         pair_logits = _forward_pair_logits(enc, dec, graph)
 
+        # A dekódolás (megoldás) idejének mérése gráfonként.
+        _t0 = time.perf_counter()
         partner = decode_fn(graph, pair_logits)
+        solve_times.append(time.perf_counter() - _t0)
 
         # Teljes párosítás ellenőrzése (minden node párt kapott-e).
         is_complete = bool((partner != -1).all().item())
@@ -248,12 +255,19 @@ def evaluate_decoder(enc, dec, val_data, decode_fn, label):
             continue
         print(f"  méret={size:>3} (n={tot}): {stable / tot:.4f}")
 
+    # Átlagos (gráfonkénti) megoldási idő.
+    avg_solve_time = (sum(solve_times) / len(solve_times)) if solve_times else 0.0
+    print(f"Átlagos megoldási idő gráfonként: "
+          f"{avg_solve_time * 1000:.3f} ms  "
+          f"(összes: {sum(solve_times):.3f} s, n={len(solve_times)})")
+
     return {
         "avg_blocking": avg_blocking,
         "stability_ratio": stability_ratio,
         "weak_stable": weak_stable,
         "complete_ratio": complete_count / max(complete_total, 1),
         "levels": dict(stability_stats),
+        "avg_solve_time": avg_solve_time,
     }
 
 
@@ -398,9 +412,11 @@ def run_both_tests():
 
 # A tesztek NEM futnak le automatikusan import-kor. Szándékos futtatáshoz:
 #
-#   python -c "import test_decoders; test_decoders.run_both_tests()"
+#   python -c "import test_decoders; test_decoders.test_irving_srt_decode()"
 #
 # vagy a következő blokk kikommentezésével / külön futtatásával.
 #
 if __name__ == "__main__":
-    run_both_tests()
+    # CSAK az Irving + modell-vezérelt holtverseny-feloldás (TESZT 2) fut,
+    # és kiírja a gráfonkénti átlagos megoldási időt.
+    test_irving_srt_decode()
